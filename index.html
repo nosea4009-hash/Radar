@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Radar RMA5 - Bernardo de Irigoyen (paleta custom)</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin="anonymous" />
+
+<style>
+  @font-face {
+    /* Tahoma se asume instalada localmente en el sistema del usuario;
+       se declara como primera opción y cae a sans-serif si no está */
+    font-family: "Tahoma";
+    src: local("Tahoma");
+  }
+
+  html, body, #map {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #14151a;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+  }
+
+  .city-label {
+    color: #f2f2f2;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+    font-weight: bold;
+    text-shadow: 0 0 3px #000, 0 0 3px #000, 0 0 3px #000;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+
+  .city-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #ffffff;
+    border: 1px solid #000;
+    box-shadow: 0 0 3px #000;
+  }
+
+  #panel {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 1000;
+    background: rgba(20, 21, 26, 0.88);
+    color: #f2f2f2;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    max-width: 230px;
+    line-height: 1.4;
+  }
+
+  #panel b { color: #ffffff; }
+
+  #status {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #9aa0a6;
+  }
+
+  #legend {
+    position: absolute;
+    bottom: 20px;
+    left: 10px;
+    z-index: 1000;
+    background: rgba(20, 21, 26, 0.88);
+    color: #f2f2f2;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 11px;
+    padding: 8px 10px;
+    border-radius: 6px;
+  }
+
+  #legend .row { display: flex; align-items: center; margin: 2px 0; }
+  #legend .swatch { width: 14px; height: 10px; margin-right: 6px; display: inline-block; border: 1px solid #0006; }
+
+  .leaflet-control-attribution {
+    background: rgba(20, 21, 26, 0.7) !important;
+    color: #ccc !important;
+  }
+  .leaflet-control-attribution a { color: #9ecbff !important; }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="panel">
+  <b>Radar RMA5 &mdash; Bernardo de Irigoyen</b><br>
+  Producto: COLMAX (dBZ)<br>
+  Fuente: OHMC (imagen ya renderizada, sin datos crudos)<br>
+  Paleta re-pintada: personalizada (.pal)
+  <div id="status">Cargando...</div>
+</div>
+
+<div id="legend">
+  <b style="font-family: Tahoma, sans-serif;">dBZ</b>
+  <div id="legend-rows"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin="anonymous"></script>
+
+<script>
+/* =========================================================================
+ * CONFIGURACION DEL RADAR
+ * Bounds tomados directamente de la API pública de OHMC:
+ * https://webmet.ohmc.ar/api_radares/radares/?format=json  (code: RMA5)
+ * ========================================================================= */
+var RADAR_CODE = "RMA5";
+var RADAR_PRODUCT = "COLMAX_00";
+var RADAR_BOUNDS = [
+  [-28.4349800000, -56.1096360500], // SW  (point2)
+  [-24.1015181100, -51.2320639500]  // NE  (point1)
+];
+var RADAR_CENTER = [-26.27812, -53.67085];
+
+/* Ciudades dentro del area de cobertura, para etiquetas propias
+ * (no dependemos de las que trae la imagen de OHMC, la imagen no trae ninguna) */
+var CITIES = [
+  { name: "Bernardo de Irigoyen", lat: -26.2581, lon: -53.6588 },
+  { name: "Posadas",              lat: -27.3671, lon: -55.8961 },
+  { name: "Encarnación",          lat: -27.3306, lon: -55.8664 },
+  { name: "Foz do Iguaçu",        lat: -25.5163, lon: -54.5854 },
+  { name: "Cascavel",             lat: -24.9555, lon: -53.4552 },
+  { name: "Chapecó",              lat: -27.0965, lon: -52.6183 },
+  { name: "Pato Branco",          lat: -26.2287, lon: -52.6763 },
+  { name: "Eldorado",             lat: -26.4008, lon: -54.6424 }
+];
+
+/* =========================================================================
+ * PALETA OFICIAL DE OHMC (fuente): -10 a 70 dBZ, 8 colores, paso 10
+ * ========================================================================= */
+var OHMC_HEX = ["#f0f6f2", "#95b4dc", "#95b4dc", "#00ad5a", "#f7a600", "#ff2a0c", "#ff2a98", "#ff29e3"];
+var OHMC_DBZ_ANCHORS = [-10, 0, 10, 20, 30, 40, 50, 60];
+
+/* =========================================================================
+ * PALETA DESTINO DEL USUARIO (Palette1 / BR / DBZ / step 5)
+ * ========================================================================= */
+var USER_STOPS = [
+  [0,    [50, 50, 50]],
+  [5,    [14, 14, 90]],
+  [10,   [3, 79, 140]],
+  [15,   [7, 162, 182]],
+  [20,   [17, 229, 31]],
+  [25,   [12, 169, 20]],
+  [34.5, [6, 104, 8]],
+  [35,   [255, 255, 0]],
+  [40,   [255, 194, 0]],
+  [45,   [255, 140, 0]],
+  [50,   [221, 0, 0]],
+  [57.5, [107, 0, 0]],
+  [62.5, [255, 163, 255]],
+  [67.5, [238, 29, 244]],
+  [72.5, [117, 0, 235]],
+  [77.5, [0, 255, 219]],
+  [82.5, [0, 76, 74]],
+  [95,   [0, 0, 0]]
+];
+
+function hexToRgb(hex) {
+  hex = hex.replace("#", "");
+  return [
+    parseInt(hex.substring(0, 2), 16),
+    parseInt(hex.substring(2, 4), 16),
+    parseInt(hex.substring(4, 6), 16)
+  ];
+}
+
+/* Construye una LUT densa (dBZ -> RGB) interpolando linealmente entre stops */
+function buildDenseLut(stopsDbz, stopsRgb, step, extendTo) {
+  var minD = stopsDbz[0];
+  var maxD = stopsDbz[stopsDbz.length - 1];
+  if (extendTo !== undefined && extendTo > maxD) maxD = extendTo;
+
+  var denseDbz = [];
+  var denseRgb = [];
+  for (var d = minD; d <= maxD + 1e-6; d += step) {
+    denseDbz.push(d);
+    denseRgb.push(interpRgbAt(d, stopsDbz, stopsRgb));
+  }
+  return { dbz: denseDbz, rgb: denseRgb };
+}
+
+function interpRgbAt(d, stopsDbz, stopsRgb) {
+  if (d <= stopsDbz[0]) return stopsRgb[0].slice();
+  if (d >= stopsDbz[stopsDbz.length - 1]) return stopsRgb[stopsRgb.length - 1].slice();
+  for (var i = 0; i < stopsDbz.length - 1; i++) {
+    var d0 = stopsDbz[i], d1 = stopsDbz[i + 1];
+    if (d >= d0 && d <= d1) {
+      var t = (d1 === d0) ? 0 : (d - d0) / (d1 - d0);
+      var c0 = stopsRgb[i], c1 = stopsRgb[i + 1];
+      return [
+        c0[0] + (c1[0] - c0[0]) * t,
+        c0[1] + (c1[1] - c0[1]) * t,
+        c0[2] + (c1[2] - c0[2]) * t
+      ];
+    }
+  }
+  return stopsRgb[stopsRgb.length - 1].slice();
+}
+
+/* --- Construir ambas LUTs una sola vez --- */
+var ohmcRgbStops = OHMC_HEX.map(hexToRgb);
+var OHMC_LUT = buildDenseLut(OHMC_DBZ_ANCHORS, ohmcRgbStops, 1, 70); // paso 1 dBZ para performance en JS
+
+var userDbzStops = USER_STOPS.map(function (s) { return s[0]; });
+var userRgbStops = USER_STOPS.map(function (s) { return s[1]; });
+var USER_LUT = buildDenseLut(userDbzStops, userRgbStops, 0.5);
+
+function nearestOhmcDbz(r, g, b) {
+  var bestDist = Infinity, bestDbz = OHMC_LUT.dbz[0];
+  var rgb = OHMC_LUT.rgb, dbz = OHMC_LUT.dbz;
+  for (var i = 0; i < rgb.length; i++) {
+    var dr = r - rgb[i][0], dg = g - rgb[i][1], db = b - rgb[i][2];
+    var dist = dr * dr + dg * dg + db * db;
+    if (dist < bestDist) { bestDist = dist; bestDbz = dbz[i]; }
+  }
+  return bestDbz;
+}
+
+function userRgbFromDbz(d) {
+  var dbz = USER_LUT.dbz, rgb = USER_LUT.rgb;
+  if (d <= dbz[0]) return rgb[0];
+  if (d >= dbz[dbz.length - 1]) return rgb[rgb.length - 1];
+  var idx = Math.round((d - dbz[0]) / (dbz[1] - dbz[0]));
+  if (idx < 0) idx = 0;
+  if (idx >= rgb.length) idx = rgb.length - 1;
+  return rgb[idx];
+}
+
+/* Repinta una imagen (canvas) reemplazando cada pixel visible por el color
+ * equivalente en la paleta del usuario, vía matching de dBZ aproximado. */
+function repaintCanvasWithUserPalette(canvas) {
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  var imgData = ctx.getImageData(0, 0, w, h);
+  var data = imgData.data;
+
+  /* cache simple: mismo color de entrada -> mismo color de salida,
+     para no recalcular en cada pixel repetido */
+  var cache = {};
+
+  for (var i = 0; i < data.length; i += 4) {
+    var a = data[i + 3];
+    if (a === 0) continue;
+
+    var r = data[i], g = data[i + 1], b = data[i + 2];
+    var key = r + "_" + g + "_" + b;
+    var out = cache[key];
+    if (!out) {
+      var dbz = nearestOhmcDbz(r, g, b);
+      out = userRgbFromDbz(dbz);
+      cache[key] = out;
+    }
+    data[i] = out[0];
+    data[i + 1] = out[1];
+    data[i + 2] = out[2];
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+}
+
+/* =========================================================================
+ * MAPA
+ * ========================================================================= */
+var map = L.map("map", {
+  center: RADAR_CENTER,
+  zoom: 7,
+  zoomControl: true
+});
+
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: "abcd",
+  maxZoom: 19
+}).addTo(map);
+
+/* Etiquetas de ciudad, en Tahoma, independientes de la imagen del radar */
+CITIES.forEach(function (c) {
+  L.marker([c.lat, c.lon], {
+    icon: L.divIcon({
+      className: "city-dot",
+      iconSize: [6, 6]
+    })
+  }).addTo(map);
+
+  L.marker([c.lat, c.lon], {
+    icon: L.divIcon({
+      className: "city-label",
+      html: c.name,
+      iconAnchor: [-8, 6]
+    }),
+    interactive: false
+  }).addTo(map);
+});
+
+/* =========================================================================
+ * OVERLAY DE RADAR (con recoloreo client-side)
+ * ========================================================================= */
+var radarOverlay = null;
+var statusEl = document.getElementById("status");
+
+function pad(n) { return n < 10 ? "0" + n : "" + n; }
+
+function buildImageUrl(dateUtc) {
+  var yyyy = dateUtc.getUTCFullYear();
+  var mm = pad(dateUtc.getUTCMonth() + 1);
+  var dd = pad(dateUtc.getUTCDate());
+  var hh = pad(dateUtc.getUTCHours());
+  var mi = pad(dateUtc.getUTCMinutes());
+  return "https://webmet.ohmc.ar/media/radares/images/" + RADAR_CODE + "/" +
+         yyyy + "/" + mm + "/" + dd + "/" +
+         RADAR_CODE + "_" + yyyy + mm + dd + "T" + hh + mi + "00Z_" + RADAR_PRODUCT + ".png";
+}
+
+/* Redondea hacia abajo al múltiplo de 10 minutos anterior (en UTC) */
+function roundDownTo10Min(d) {
+  var r = new Date(d.getTime());
+  r.setUTCMinutes(Math.floor(r.getUTCMinutes() / 10) * 10, 0, 0);
+  return r;
+}
+
+function loadRadarImage(attempt) {
+  attempt = attempt || 0;
+  var maxAttempts = 6; // hasta 1 hora hacia atras, de 10 en 10 minutos
+
+  var base = roundDownTo10Min(new Date());
+  var target = new Date(base.getTime() - attempt * 10 * 60 * 1000);
+  var url = buildImageUrl(target);
+
+  statusEl.textContent = "Buscando imagen " + target.toISOString().substr(11, 5) + "Z ...";
+
+  var img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = function () {
+    var canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    var ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    try {
+      repaintCanvasWithUserPalette(canvas);
+    } catch (e) {
+      console.error("No se pudo repintar (posible bloqueo CORS):", e);
+    }
+
+    var dataUrl = canvas.toDataURL("image/png");
+
+    if (radarOverlay) {
+      radarOverlay.setUrl(dataUrl);
+    } else {
+      radarOverlay = L.imageOverlay(dataUrl, RADAR_BOUNDS, { opacity: 0.85 }).addTo(map);
+    }
+
+    statusEl.textContent = "Mostrando " + target.toISOString().substr(0, 16).replace("T", " ") + " UTC";
+  };
+  img.onerror = function () {
+    if (attempt < maxAttempts) {
+      loadRadarImage(attempt + 1);
+    } else {
+      statusEl.textContent = "Sin imagenes recientes disponibles.";
+    }
+  };
+  img.src = url;
+}
+
+loadRadarImage();
+/* Refresco automático cada 2 minutos */
+setInterval(function () { loadRadarImage(); }, 2 * 60 * 1000);
+
+/* =========================================================================
+ * LEYENDA (paleta destino del usuario)
+ * ========================================================================= */
+var legendRows = document.getElementById("legend-rows");
+USER_STOPS.forEach(function (s) {
+  var row = document.createElement("div");
+  row.className = "row";
+  var sw = document.createElement("span");
+  sw.className = "swatch";
+  sw.style.background = "rgb(" + s[1][0] + "," + s[1][1] + "," + s[1][2] + ")";
+  row.appendChild(sw);
+  var txt = document.createTextNode(s[0] + " dBZ");
+  row.appendChild(txt);
+  legendRows.appendChild(row);
+});
+</script>
+
+</body>
+</html>
