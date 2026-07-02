@@ -205,6 +205,82 @@
   }
   #pal-status.error { color: #ff8a8a; }
   #pal-status.ok { color: #8fd18f; }
+
+  /* --- Selector de producto --- */
+  #product-select {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 4px;
+    margin-bottom: 4px;
+    background: #1f2027;
+    color: #f2f2f2;
+    border: 1px solid #3a3b42;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+  }
+
+  /* --- Controles de reproduccion --- */
+  #playback {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    background: rgba(20, 21, 26, 0.9);
+    color: #f2f2f2;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    padding: 8px 14px;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 320px;
+    max-width: 90vw;
+  }
+
+  #playback-buttons {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  #playback-buttons button {
+    background: #2a2b32;
+    color: #f2f2f2;
+    border: 1px solid #3a3b42;
+    border-radius: 50%;
+    width: 32px;
+    height: 32px;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #playback-buttons button:hover { background: #3a3b42; }
+  #playback-buttons button:disabled { opacity: 0.4; cursor: default; }
+
+  #play-pause-btn {
+    background: #2a6fd6 !important;
+    border-color: #2a6fd6 !important;
+    width: 38px !important;
+    height: 38px !important;
+  }
+  #play-pause-btn:hover { background: #3a80e6 !important; }
+
+  #frame-slider {
+    width: 100%;
+    margin: 2px 0;
+  }
+
+  #frame-time-label {
+    font-size: 11px;
+    color: #cfd2d6;
+  }
 </style>
 </head>
 <body>
@@ -213,18 +289,34 @@
 
 <div id="panel">
   <b>Radar RMA5 &mdash; Bernardo de Irigoyen</b><br>
-  Producto: COLMAX (dBZ)<br>
+  Producto: <span id="product-info">COLMAX (dBZ)</span><br>
   Fuente: OHMC (imagen ya renderizada, sin datos crudos)<br>
-  Paleta re-pintada: personalizada (.pal)
+  <span id="palette-info-line">Paleta re-pintada: personalizada (.pal)</span>
   <div id="status">Cargando...</div>
 </div>
 
 <div id="legend">
-  <b style="font-family: Tahoma, sans-serif;">dBZ</b>
+  <b style="font-family: Tahoma, sans-serif;" id="legend-title">dBZ</b>
   <div id="legend-rows"></div>
 </div>
 
+<div id="playback">
+  <div id="playback-buttons">
+    <button id="btn-prev" title="Frame anterior">&#9664;&#9664;</button>
+    <button id="play-pause-btn" title="Reproducir/Pausar">&#9654;</button>
+    <button id="btn-next" title="Frame siguiente">&#9654;&#9654;</button>
+  </div>
+  <input type="range" id="frame-slider" min="0" max="0" value="0" step="1" />
+  <div id="frame-time-label">Cargando frames...</div>
+</div>
+
 <div id="basemap-control">
+  <b>Producto de radar</b>
+  <select id="product-select">
+    <option value="COLMAX">COLMAX (reflectividad, dBZ)</option>
+    <option value="VRAD">VRAD (velocidad Doppler)</option>
+  </select>
+
   <b>Estilo de mapa</b>
   <select id="basemap-select">
     <option value="dark_matter">Oscuro (CARTO Dark Matter)</option>
@@ -423,8 +515,9 @@ function alphaFadeFactor(dbz) {
 
 /* Repinta una imagen (canvas) reemplazando cada pixel visible por el color
  * equivalente en la paleta del usuario, vía matching de dBZ aproximado,
- * y ajusta la opacidad de cada pixel segun esa misma intensidad estimada. */
-function repaintCanvasWithUserPalette(canvas) {
+ * y ajusta la opacidad de cada pixel segun esa misma intensidad estimada.
+ * Usado para productos de REFLECTIVIDAD (ej. COLMAX). */
+function recolorReflectivity(canvas) {
   var ctx = canvas.getContext("2d");
   var w = canvas.width, h = canvas.height;
   var imgData = ctx.getImageData(0, 0, w, h);
@@ -455,6 +548,66 @@ function repaintCanvasWithUserPalette(canvas) {
 
   ctx.putImageData(imgData, 0, 0);
 }
+
+/* VRAD (velocidad Doppler) usa un esquema de color totalmente distinto
+ * (nativo de OHMC: rojo = alejandose, verde = acercandose, tonos oscuros
+ * cerca de velocidad ~0). No tiene sentido reinterpretarlo con la paleta
+ * de reflectividad del usuario, asi que se mantienen sus colores originales
+ * y solo se aplica un desvanecido de opacidad segun la magnitud del color,
+ * para limpiar el ruido cercano a velocidad cero (igual criterio que se usa
+ * en COLMAX, pero basado en distancia de color al negro en vez de dBZ). */
+var VRAD_FADE_FLOOR = 0.08;
+var VRAD_FADE_CEIL = 0.35;
+
+function recolorVelocity(canvas) {
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  var imgData = ctx.getImageData(0, 0, w, h);
+  var data = imgData.data;
+  var maxMag = Math.sqrt(3 * 255 * 255);
+
+  for (var i = 0; i < data.length; i += 4) {
+    var a = data[i + 3];
+    if (a === 0) continue;
+
+    var r = data[i], g = data[i + 1], b = data[i + 2];
+    var mag = Math.sqrt(r * r + g * g + b * b) / maxMag;
+    var t = (mag - VRAD_FADE_FLOOR) / (VRAD_FADE_CEIL - VRAD_FADE_FLOOR);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    data[i + 3] = a * t;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+}
+
+/* =========================================================================
+ * PRODUCTOS DISPONIBLES
+ * Confirmados manualmente contra el servidor de OHMC para RMA5 (algunos
+ * productos listados en /api_radares/radares_prod/ no estan disponibles
+ * para todos los radares/horarios, por eso solo se exponen los que se
+ * verificaron con datos reales).
+ * ========================================================================= */
+var PRODUCTS = {
+  COLMAX: {
+    code: "COLMAX_00",
+    label: "COLMAX (dBZ)",
+    legendTitle: "dBZ",
+    usesUserPalette: true,
+    recolor: recolorReflectivity
+  },
+  VRAD: {
+    code: "VRAD_00",
+    label: "velocidad Doppler",
+    legendTitle: "Velocidad Doppler (esquema nativo OHMC)",
+    usesUserPalette: false,
+    recolor: recolorVelocity
+  }
+};
+
+var STORAGE_KEY_PRODUCT = "radar_selected_product";
+var currentProductKey = localStorage.getItem(STORAGE_KEY_PRODUCT) || "COLMAX";
+if (!PRODUCTS[currentProductKey]) currentProductKey = "COLMAX";
 
 /* =========================================================================
  * MAPA
@@ -613,13 +766,17 @@ CITIES.forEach(function (c) {
 });
 
 /* =========================================================================
- * OVERLAY DE RADAR (con recoloreo client-side)
+ * OVERLAY DE RADAR + BUFFER DE FRAMES + REPRODUCCION
  * ========================================================================= */
 var radarOverlay = null;
 
+var FRAME_STEP_MIN = 10;      // cadencia nominal de OHMC
+var FRAME_HISTORY_COUNT = 12; // ~2 horas hacia atras (12 x 10 min)
+var FRAME_MAX_LOOKBACK_STEPS = 6; // por frame, cuantos pasos de 10 min retroceder si falta
+
 function pad(n) { return n < 10 ? "0" + n : "" + n; }
 
-function buildImageUrl(dateUtc) {
+function buildImageUrl(dateUtc, productCode) {
   var yyyy = dateUtc.getUTCFullYear();
   var mm = pad(dateUtc.getUTCMonth() + 1);
   var dd = pad(dateUtc.getUTCDate());
@@ -627,64 +784,252 @@ function buildImageUrl(dateUtc) {
   var mi = pad(dateUtc.getUTCMinutes());
   return "https://webmet.ohmc.ar/media/radares/images/" + RADAR_CODE + "/" +
          yyyy + "/" + mm + "/" + dd + "/" +
-         RADAR_CODE + "_" + yyyy + mm + dd + "T" + hh + mi + "00Z_" + RADAR_PRODUCT + ".png";
+         RADAR_CODE + "_" + yyyy + mm + dd + "T" + hh + mi + "00Z_" + productCode + ".png";
 }
 
-/* Redondea hacia abajo al múltiplo de 10 minutos anterior (en UTC) */
-function roundDownTo10Min(d) {
+/* Redondea hacia abajo al múltiplo de N minutos anterior (en UTC) */
+function roundDownToStep(d, stepMin) {
   var r = new Date(d.getTime());
-  r.setUTCMinutes(Math.floor(r.getUTCMinutes() / 10) * 10, 0, 0);
+  r.setUTCMinutes(Math.floor(r.getUTCMinutes() / stepMin) * stepMin, 0, 0);
   return r;
 }
 
-function loadRadarImage(attempt) {
-  attempt = attempt || 0;
-  var maxAttempts = 6; // hasta 1 hora hacia atras, de 10 en 10 minutos
+/* --- Estado del buffer de frames ---
+ * frames[i] = { time: Date, dataUrl: string|null, loading: bool, failed: bool }
+ * Los frames se generan por timestamp nominal (cada FRAME_STEP_MIN), y cada
+ * uno reintenta buscar hacia atras (dentro de su propia ranura) si el
+ * timestamp exacto no existe todavia (igual mecanismo que ya se usaba antes
+ * para el frame "en vivo", ahora aplicado a todo el historico). */
+var frames = [];          // ordenados de mas viejo a mas nuevo
+var currentFrameIndex = -1;
+var isPlaying = false;
+var playTimer = null;
+var PLAY_INTERVAL_MS = 800;
 
-  var base = roundDownTo10Min(new Date());
-  var target = new Date(base.getTime() - attempt * 10 * 60 * 1000);
-  var url = buildImageUrl(target);
+var frameSlider = document.getElementById("frame-slider");
+var frameTimeLabel = document.getElementById("frame-time-label");
+var playPauseBtn = document.getElementById("play-pause-btn");
+var btnPrev = document.getElementById("btn-prev");
+var btnNext = document.getElementById("btn-next");
 
-  statusEl.textContent = "Buscando imagen " + target.toISOString().substr(11, 5) + "Z ...";
+function fetchAndRecolorFrame(nominalTime, productKey, onDone) {
+  var product = PRODUCTS[productKey];
+  var attempt = 0;
 
-  var img = new Image();
-  img.crossOrigin = "anonymous";
-  img.onload = function () {
-    var canvas = document.createElement("canvas");
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    var ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0);
+  function tryStep() {
+    var target = new Date(nominalTime.getTime() - attempt * FRAME_STEP_MIN * 60 * 1000);
+    var url = buildImageUrl(target, product.code);
 
-    try {
-      repaintCanvasWithUserPalette(canvas);
-    } catch (e) {
-      console.error("No se pudo repintar (posible bloqueo CORS):", e);
-    }
+    var img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = function () {
+      var canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      var ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      try {
+        product.recolor(canvas);
+      } catch (e) {
+        console.error("No se pudo repintar (posible bloqueo CORS):", e);
+      }
+      onDone(canvas.toDataURL("image/png"), target);
+    };
+    img.onerror = function () {
+      attempt++;
+      if (attempt <= FRAME_MAX_LOOKBACK_STEPS) {
+        tryStep();
+      } else {
+        onDone(null, nominalTime);
+      }
+    };
+    img.src = url;
+  }
 
-    var dataUrl = canvas.toDataURL("image/png");
-
-    if (radarOverlay) {
-      radarOverlay.setUrl(dataUrl);
-    } else {
-      radarOverlay = L.imageOverlay(dataUrl, RADAR_BOUNDS, { opacity: 0.85 }).addTo(map);
-    }
-
-    statusEl.textContent = "Mostrando " + target.toISOString().substr(0, 16).replace("T", " ") + " UTC";
-  };
-  img.onerror = function () {
-    if (attempt < maxAttempts) {
-      loadRadarImage(attempt + 1);
-    } else {
-      statusEl.textContent = "Sin imagenes recientes disponibles.";
-    }
-  };
-  img.src = url;
+  tryStep();
 }
 
-loadRadarImage();
-/* Refresco automático cada 2 minutos */
-setInterval(function () { loadRadarImage(); }, 2 * 60 * 1000);
+function setSliderRange() {
+  frameSlider.min = 0;
+  frameSlider.max = Math.max(0, frames.length - 1);
+}
+
+function updateFrameLabel() {
+  if (currentFrameIndex < 0 || !frames[currentFrameIndex]) {
+    frameTimeLabel.textContent = "Sin frames disponibles.";
+    return;
+  }
+  var f = frames[currentFrameIndex];
+  var label = f.time.toISOString().substr(0, 16).replace("T", " ") + " UTC";
+  if (f.failed) label += " (sin datos, ultimo frame valido)";
+  frameTimeLabel.textContent = "Frame " + (currentFrameIndex + 1) + "/" + frames.length + " - " + label;
+  statusEl.textContent = "Mostrando " + label;
+}
+
+function showFrame(index) {
+  if (index < 0 || index >= frames.length) return;
+  currentFrameIndex = index;
+  frameSlider.value = index;
+
+  var f = frames[index];
+  if (!f.dataUrl) {
+    updateFrameLabel();
+    return; // todavia cargando o sin datos; el overlay se queda con el anterior
+  }
+
+  if (radarOverlay) {
+    radarOverlay.setUrl(f.dataUrl);
+  } else {
+    radarOverlay = L.imageOverlay(f.dataUrl, RADAR_BOUNDS, { opacity: 0.85 }).addTo(map);
+  }
+  updateFrameLabel();
+}
+
+/* Construye el buffer completo de frames historicos + el frame "en vivo",
+ * descargando y recoloreando cada uno. Se usa al iniciar y al cambiar de
+ * producto (ya que VRAD/COLMAX no comparten cache de recoloreo). */
+function rebuildFrameBuffer() {
+  stopPlayback();
+  frames = [];
+  currentFrameIndex = -1;
+  radarOverlay && map.removeLayer(radarOverlay);
+  radarOverlay = null;
+  frameTimeLabel.textContent = "Cargando frames...";
+
+  var latest = roundDownToStep(new Date(), FRAME_STEP_MIN);
+  var nominalTimes = [];
+  for (var i = FRAME_HISTORY_COUNT - 1; i >= 0; i--) {
+    nominalTimes.push(new Date(latest.getTime() - i * FRAME_STEP_MIN * 60 * 1000));
+  }
+
+  frames = nominalTimes.map(function (t) {
+    return { time: t, dataUrl: null, loading: true, failed: false };
+  });
+  setSliderRange();
+
+  var pending = frames.length;
+  frames.forEach(function (frameObj, idx) {
+    fetchAndRecolorFrame(frameObj.time, currentProductKey, function (dataUrl, actualTime) {
+      frameObj.loading = false;
+      frameObj.dataUrl = dataUrl;
+      frameObj.failed = !dataUrl;
+      frameObj.time = actualTime;
+      pending--;
+
+      /* mostrar el ultimo frame disponible en cuanto termine de cargar,
+         para no dejar el mapa en blanco mientras el resto sigue bajando */
+      if (idx === frames.length - 1 && dataUrl) {
+        showFrame(idx);
+      } else if (pending === 0) {
+        /* todos terminaron: si el ultimo fallo, mostrar el ultimo valido */
+        var lastValid = frames.length - 1;
+        while (lastValid >= 0 && !frames[lastValid].dataUrl) lastValid--;
+        if (lastValid >= 0 && currentFrameIndex === -1) showFrame(lastValid);
+      }
+    });
+  });
+}
+
+/* Agrega un nuevo frame "en vivo" al final del buffer si ya paso suficiente
+ * tiempo, sin reconstruir todo el historico (usado por el auto-refresco). */
+function appendLiveFrameIfNeeded() {
+  var latest = roundDownToStep(new Date(), FRAME_STEP_MIN);
+  var lastKnown = frames.length ? frames[frames.length - 1].time : null;
+  if (lastKnown && latest.getTime() <= lastKnown.getTime()) return;
+
+  var wasAtLastFrame = (currentFrameIndex === frames.length - 1);
+  var newFrame = { time: latest, dataUrl: null, loading: true, failed: false };
+  frames.push(newFrame);
+
+  /* limitar el tamano del buffer para no acumular memoria indefinidamente */
+  while (frames.length > FRAME_HISTORY_COUNT) {
+    frames.shift();
+    if (currentFrameIndex > 0) currentFrameIndex--;
+  }
+  setSliderRange();
+
+  fetchAndRecolorFrame(newFrame.time, currentProductKey, function (dataUrl, actualTime) {
+    newFrame.loading = false;
+    newFrame.dataUrl = dataUrl;
+    newFrame.failed = !dataUrl;
+    newFrame.time = actualTime;
+    /* si el usuario estaba viendo el frame mas reciente ("en vivo"),
+       lo seguimos automaticamente al nuevo frame */
+    if (wasAtLastFrame && dataUrl) {
+      showFrame(frames.length - 1);
+    }
+  });
+}
+
+/* --- Controles de reproduccion --- */
+function stopPlayback() {
+  isPlaying = false;
+  playPauseBtn.innerHTML = "&#9654;";
+  if (playTimer) {
+    clearInterval(playTimer);
+    playTimer = null;
+  }
+}
+
+function startPlayback() {
+  if (frames.length < 2) return;
+  isPlaying = true;
+  playPauseBtn.innerHTML = "&#10074;&#10074;";
+  playTimer = setInterval(function () {
+    var next = currentFrameIndex + 1;
+    if (next >= frames.length) next = 0; // loop al llegar al final
+    showFrame(next);
+  }, PLAY_INTERVAL_MS);
+}
+
+playPauseBtn.addEventListener("click", function () {
+  if (isPlaying) stopPlayback(); else startPlayback();
+});
+
+btnPrev.addEventListener("click", function () {
+  stopPlayback();
+  showFrame(Math.max(0, currentFrameIndex - 1));
+});
+
+btnNext.addEventListener("click", function () {
+  stopPlayback();
+  showFrame(Math.min(frames.length - 1, currentFrameIndex + 1));
+});
+
+frameSlider.addEventListener("input", function () {
+  stopPlayback();
+  showFrame(parseInt(frameSlider.value, 10));
+});
+
+/* --- Selector de producto --- */
+var productSelect = document.getElementById("product-select");
+var productInfoEl = document.getElementById("product-info");
+var paletteInfoLine = document.getElementById("palette-info-line");
+var legendTitleEl = document.getElementById("legend-title");
+var paletteImportSection = document.getElementById("palette-import");
+
+function applyProductUiState() {
+  var product = PRODUCTS[currentProductKey];
+  productInfoEl.textContent = product.label;
+  legendTitleEl.textContent = product.legendTitle;
+  paletteInfoLine.style.display = product.usesUserPalette ? "" : "none";
+  paletteImportSection.style.display = product.usesUserPalette ? "" : "none";
+  document.getElementById("legend").style.display = product.usesUserPalette ? "" : "none";
+}
+
+productSelect.value = currentProductKey;
+applyProductUiState();
+
+productSelect.addEventListener("change", function () {
+  currentProductKey = productSelect.value;
+  localStorage.setItem(STORAGE_KEY_PRODUCT, currentProductKey);
+  applyProductUiState();
+  rebuildFrameBuffer();
+});
+
+/* --- Arranque inicial + auto-refresco --- */
+rebuildFrameBuffer();
+setInterval(function () { appendLiveFrameIfNeeded(); }, 2 * 60 * 1000);
 
 /* =========================================================================
  * LEYENDA (paleta destino del usuario)
@@ -757,8 +1102,11 @@ function applyUserPalette(stops, persist) {
       console.warn("No se pudo guardar la paleta en localStorage:", e);
     }
   }
-  /* forzar repintado inmediato del frame actual con la nueva paleta */
-  loadRadarImage();
+  /* forzar reconstruccion del buffer de frames con la nueva paleta, solo
+     si el producto activo usa la paleta del usuario (ej. COLMAX; VRAD no) */
+  if (PRODUCTS[currentProductKey].usesUserPalette) {
+    rebuildFrameBuffer();
+  }
 }
 
 var palStatusEl = document.getElementById("pal-status");
