@@ -136,13 +136,75 @@
 
   #mapbox-fields { display: none; }
 
-  #basemap-hint {
+  #basemap-hint,
+  .basemap-hint {
     font-size: 10px;
     color: #9aa0a6;
     margin-top: -4px;
     margin-bottom: 8px;
     line-height: 1.3;
   }
+
+  /* --- Importador de paletas .pal --- */
+  #palette-import {
+    margin-top: 8px;
+    border-top: 1px solid #3a3b42;
+    padding-top: 8px;
+  }
+
+  #palette-import label {
+    display: block;
+    font-size: 10px;
+    color: #9aa0a6;
+    margin-bottom: 2px;
+  }
+
+  #palette-import input[type="file"] {
+    width: 100%;
+    font-size: 10px;
+    color: #f2f2f2;
+    margin-bottom: 6px;
+  }
+
+  #palette-import textarea {
+    width: 100%;
+    box-sizing: border-box;
+    height: 70px;
+    background: #1f2027;
+    color: #f2f2f2;
+    border: 1px solid #3a3b42;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 10px;
+    margin-bottom: 6px;
+    resize: vertical;
+  }
+
+  #palette-import button {
+    width: 100%;
+    background: #2a6fd6;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 11px;
+    cursor: pointer;
+    margin-bottom: 6px;
+  }
+
+  #palette-import button:hover { background: #3a80e6; }
+  #palette-import #pal-reset { background: #55565e; }
+  #palette-import #pal-reset:hover { background: #64656e; }
+
+  #pal-status {
+    font-size: 10px;
+    line-height: 1.3;
+    margin-top: 2px;
+    color: #9aa0a6;
+  }
+  #pal-status.error { color: #ff8a8a; }
+  #pal-status.ok { color: #8fd18f; }
 </style>
 </head>
 <body>
@@ -185,6 +247,21 @@
     </div>
     <button id="mapbox-apply">Aplicar</button>
   </div>
+
+  <div id="palette-import">
+    <b>Paleta de color (.pal)</b>
+    <div class="basemap-hint" style="margin-top:4px;">
+      Formato tipo GR2Analyst: lineas <code>Color: dBZ R G B</code>.
+      Se aplica sobre el radar, no sobre el mapa base.
+    </div>
+    <label>Importar archivo .pal</label>
+    <input type="file" id="pal-file" accept=".pal,.txt" />
+    <label>...o pegar el contenido aqui</label>
+    <textarea id="pal-textarea" placeholder="Color:   0    50   50   50&#10;Color:   5    14   14   90&#10;..."></textarea>
+    <button id="pal-apply">Aplicar paleta pegada</button>
+    <button id="pal-reset">Restaurar paleta por defecto</button>
+    <div id="pal-status"></div>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -226,8 +303,10 @@ var OHMC_DBZ_ANCHORS = [-10, 0, 10, 20, 30, 40, 50, 60];
 
 /* =========================================================================
  * PALETA DESTINO DEL USUARIO (Palette1 / BR / DBZ / step 5)
+ * Esta es la paleta por defecto. El usuario puede reemplazarla importando
+ * un archivo .pal (ver seccion "Importador de paleta .pal" mas abajo).
  * ========================================================================= */
-var USER_STOPS = [
+var DEFAULT_USER_STOPS = [
   [0,    [50, 50, 50]],
   [5,    [14, 14, 90]],
   [10,   [3, 79, 140]],
@@ -247,6 +326,8 @@ var USER_STOPS = [
   [82.5, [0, 76, 74]],
   [95,   [0, 0, 0]]
 ];
+
+var USER_STOPS = DEFAULT_USER_STOPS;
 
 function hexToRgb(hex) {
   hex = hex.replace("#", "");
@@ -294,9 +375,16 @@ function interpRgbAt(d, stopsDbz, stopsRgb) {
 var ohmcRgbStops = OHMC_HEX.map(hexToRgb);
 var OHMC_LUT = buildDenseLut(OHMC_DBZ_ANCHORS, ohmcRgbStops, 1, 70); // paso 1 dBZ para performance en JS
 
-var userDbzStops = USER_STOPS.map(function (s) { return s[0]; });
-var userRgbStops = USER_STOPS.map(function (s) { return s[1]; });
-var USER_LUT = buildDenseLut(userDbzStops, userRgbStops, 0.5);
+var USER_LUT = null;
+
+/* (Re)construye la LUT densa a partir de USER_STOPS actual. Se llama al
+ * iniciar y cada vez que se importa/restaura una paleta nueva. */
+function rebuildUserLut() {
+  var userDbzStops = USER_STOPS.map(function (s) { return s[0]; });
+  var userRgbStops = USER_STOPS.map(function (s) { return s[1]; });
+  USER_LUT = buildDenseLut(userDbzStops, userRgbStops, 0.5);
+}
+rebuildUserLut();
 
 function nearestOhmcDbz(r, g, b) {
   var bestDist = Infinity, bestDbz = OHMC_LUT.dbz[0];
@@ -602,17 +690,145 @@ setInterval(function () { loadRadarImage(); }, 2 * 60 * 1000);
  * LEYENDA (paleta destino del usuario)
  * ========================================================================= */
 var legendRows = document.getElementById("legend-rows");
-USER_STOPS.forEach(function (s) {
-  var row = document.createElement("div");
-  row.className = "row";
-  var sw = document.createElement("span");
-  sw.className = "swatch";
-  sw.style.background = "rgb(" + s[1][0] + "," + s[1][1] + "," + s[1][2] + ")";
-  row.appendChild(sw);
-  var txt = document.createTextNode(s[0] + " dBZ");
-  row.appendChild(txt);
-  legendRows.appendChild(row);
+
+function renderLegend() {
+  legendRows.innerHTML = "";
+  USER_STOPS.forEach(function (s) {
+    var row = document.createElement("div");
+    row.className = "row";
+    var sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = "rgb(" + s[1][0] + "," + s[1][1] + "," + s[1][2] + ")";
+    row.appendChild(sw);
+    var txt = document.createTextNode(s[0] + " dBZ");
+    row.appendChild(txt);
+    legendRows.appendChild(row);
+  });
+}
+renderLegend();
+
+/* =========================================================================
+ * IMPORTADOR DE PALETA .PAL
+ * Formato esperado (tipo GR2Analyst / IRIS), por ejemplo:
+ *   Product: BR
+ *   Units: DBZ
+ *   Step: 5
+ *   Color:   0     50   50   50
+ *   Color:   5     14   14   90
+ *   ...
+ * Se aceptan valores de dBZ decimales y espacios variables. Las lineas que
+ * no matchean el patron "Color: <numero> <r> <g> <b>" se ignoran.
+ * ========================================================================= */
+var STORAGE_KEY_USER_PALETTE = "radar_custom_palette";
+
+function parsePalFile(text) {
+  var lines = text.split(/\r?\n/);
+  var stops = [];
+  var colorLineRe = /^\s*color\s*:?\s*([\-\d.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/i;
+
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(colorLineRe);
+    if (!m) continue;
+    var dbz = parseFloat(m[1]);
+    var r = parseInt(m[2], 10);
+    var g = parseInt(m[3], 10);
+    var b = parseInt(m[4], 10);
+    if (isNaN(dbz) || isNaN(r) || isNaN(g) || isNaN(b)) continue;
+    stops.push([dbz, [r, g, b]]);
+  }
+
+  if (stops.length < 2) {
+    throw new Error("No se encontraron al menos 2 lineas de color validas (formato esperado: 'Color: dBZ R G B').");
+  }
+
+  /* asegurar orden ascendente por dBZ, ya que buildDenseLut lo asume */
+  stops.sort(function (a, b) { return a[0] - b[0]; });
+  return stops;
+}
+
+function applyUserPalette(stops, persist) {
+  USER_STOPS = stops;
+  rebuildUserLut();
+  renderLegend();
+  if (persist) {
+    try {
+      localStorage.setItem(STORAGE_KEY_USER_PALETTE, JSON.stringify(stops));
+    } catch (e) {
+      console.warn("No se pudo guardar la paleta en localStorage:", e);
+    }
+  }
+  /* forzar repintado inmediato del frame actual con la nueva paleta */
+  loadRadarImage();
+}
+
+var palStatusEl = document.getElementById("pal-status");
+
+function setPalStatus(msg, kind) {
+  palStatusEl.textContent = msg;
+  palStatusEl.className = kind || "";
+}
+
+function tryApplyPalText(text, persist) {
+  try {
+    var stops = parsePalFile(text);
+    applyUserPalette(stops, persist);
+    setPalStatus("Paleta aplicada (" + stops.length + " colores).", "ok");
+  } catch (e) {
+    setPalStatus("Error al importar: " + e.message, "error");
+  }
+}
+
+document.getElementById("pal-file").addEventListener("change", function (evt) {
+  var file = evt.target.files && evt.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function () {
+    document.getElementById("pal-textarea").value = reader.result;
+    tryApplyPalText(reader.result, true);
+  };
+  reader.onerror = function () {
+    setPalStatus("No se pudo leer el archivo.", "error");
+  };
+  reader.readAsText(file);
 });
+
+document.getElementById("pal-apply").addEventListener("click", function () {
+  var text = document.getElementById("pal-textarea").value;
+  if (!text.trim()) {
+    setPalStatus("Pegue el contenido de un .pal primero.", "error");
+    return;
+  }
+  tryApplyPalText(text, true);
+});
+
+document.getElementById("pal-reset").addEventListener("click", function () {
+  localStorage.removeItem(STORAGE_KEY_USER_PALETTE);
+  document.getElementById("pal-textarea").value = "";
+  document.getElementById("pal-file").value = "";
+  applyUserPalette(DEFAULT_USER_STOPS, false);
+  setPalStatus("Paleta por defecto restaurada.", "ok");
+});
+
+/* Restaurar paleta guardada de una sesion anterior, si existe.
+ * Se hace luego de la primera carga del radar (que ya ocurrio con la
+ * paleta por defecto), por lo que aqui se fuerza un repintado inmediato
+ * para que la imagen visible coincida con la paleta restaurada. */
+(function restoreSavedPalette() {
+  var saved = localStorage.getItem(STORAGE_KEY_USER_PALETTE);
+  if (!saved) return;
+  try {
+    var stops = JSON.parse(saved);
+    if (Array.isArray(stops) && stops.length >= 2) {
+      document.getElementById("pal-textarea").value = stops
+        .map(function (s) { return "Color: " + s[0] + " " + s[1][0] + " " + s[1][1] + " " + s[1][2]; })
+        .join("\n");
+      applyUserPalette(stops, false);
+      setPalStatus("Paleta personalizada restaurada de la sesion anterior.", "ok");
+    }
+  } catch (e) {
+    console.warn("No se pudo restaurar la paleta guardada:", e);
+  }
+})();
 </script>
 
 </body>
