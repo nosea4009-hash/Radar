@@ -281,6 +281,94 @@
     font-size: 11px;
     color: #cfd2d6;
   }
+
+  /* --- Importador de GeoJSON (limites administrativos) --- */
+  #geojson-import {
+    margin-top: 8px;
+    border-top: 1px solid #3a3b42;
+    padding-top: 8px;
+  }
+
+  #geojson-import label {
+    display: block;
+    font-size: 10px;
+    color: #9aa0a6;
+    margin-bottom: 2px;
+  }
+
+  #geojson-import input[type="file"] {
+    width: 100%;
+    font-size: 10px;
+    color: #f2f2f2;
+    margin-bottom: 6px;
+  }
+
+  #geojson-import select {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 6px;
+    background: #1f2027;
+    color: #f2f2f2;
+    border: 1px solid #3a3b42;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-family: Tahoma, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+  }
+
+  #geojson-layers-list {
+    max-height: 110px;
+    overflow-y: auto;
+    margin-bottom: 6px;
+  }
+
+  .geojson-layer-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    padding: 3px 0;
+    border-bottom: 1px solid #2a2b32;
+  }
+
+  .geojson-layer-row span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    margin-right: 6px;
+  }
+
+  .geojson-layer-row button {
+    background: #55565e;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+    cursor: pointer;
+    width: auto;
+  }
+
+  .geojson-layer-row button:hover { background: #6a6b73; }
+
+  #geojson-status {
+    font-size: 10px;
+    line-height: 1.3;
+    margin-top: 2px;
+    color: #9aa0a6;
+  }
+  #geojson-status.error { color: #ff8a8a; }
+  #geojson-status.ok { color: #8fd18f; }
+
+  /* Estilo visual de los limites administrativos importados.
+     El color real (blanco/negro) se aplica inline por JS segun el
+     tema del mapa actual; aca solo se fija el resto de la apariencia. */
+  .admin-boundary-path {
+    fill: none;
+    stroke-width: 1.4;
+    stroke-linejoin: round;
+  }
 </style>
 </head>
 <body>
@@ -353,6 +441,24 @@
     <button id="pal-apply">Aplicar paleta pegada</button>
     <button id="pal-reset">Restaurar paleta por defecto</button>
     <div id="pal-status"></div>
+  </div>
+
+  <div id="geojson-import">
+    <b>Limites (GeoJSON provincias/departamentos)</b>
+    <div class="basemap-hint" style="margin-top:4px;">
+      Se dibujan en blanco sobre mapas oscuros y en negro sobre mapas claros
+      (automatico, o fijo segun lo que elijas abajo).
+    </div>
+    <label>Color de linea</label>
+    <select id="geojson-color-mode">
+      <option value="auto">Automatico segun tema del mapa</option>
+      <option value="white">Siempre blanco</option>
+      <option value="black">Siempre negro</option>
+    </select>
+    <label>Importar archivo .geojson / .json</label>
+    <input type="file" id="geojson-file" accept=".geojson,.json" multiple />
+    <div id="geojson-layers-list"></div>
+    <div id="geojson-status"></div>
   </div>
 </div>
 
@@ -623,6 +729,7 @@ var statusEl = document.getElementById("status");
 /* --- Definicion de estilos de mapa base disponibles (sin API key) --- */
 var BASEMAPS = {
   dark_matter: {
+    isDark: true,
     url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
@@ -631,6 +738,7 @@ var BASEMAPS = {
     }
   },
   positron: {
+    isDark: false,
     url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
@@ -639,6 +747,7 @@ var BASEMAPS = {
     }
   },
   voyager: {
+    isDark: false,
     url: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
@@ -647,6 +756,7 @@ var BASEMAPS = {
     }
   },
   osm: {
+    isDark: false,
     url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -655,6 +765,7 @@ var BASEMAPS = {
     }
   },
   esri_satellite: {
+    isDark: true, // satelite: fondo predominantemente oscuro/variado, blanco se ve mejor
     url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     options: {
       attribution: "Tiles &copy; Esri",
@@ -668,6 +779,7 @@ var STORAGE_KEY_MAPBOX_STYLE = "radar_mapbox_style";
 var STORAGE_KEY_MAPBOX_TOKEN = "radar_mapbox_token";
 
 var currentBaseLayer = null;
+var currentBasemapKey = null; // se actualiza en setBasemap(); usado por el importador de GeoJSON
 
 /* Normaliza un Style URL/ID de Mapbox a la forma "usuario/estilo_id" */
 function parseMapboxStyle(input) {
@@ -713,7 +825,14 @@ function setBasemap(key) {
     currentBaseLayer = L.tileLayer(cfg.url, cfg.options).addTo(map);
   }
 
+  currentBasemapKey = key;
   localStorage.setItem(STORAGE_KEY_BASEMAP, key);
+
+  /* si ya hay capas de limites importadas, recalcular su color segun
+     el nuevo tema (solo aplica en modo "automatico") */
+  if (typeof restyleAllGeojsonLayers === "function") {
+    restyleAllGeojsonLayers();
+  }
 }
 
 /* --- UI del selector de mapa --- */
@@ -745,6 +864,133 @@ mapboxApplyBtn.addEventListener("click", function () {
 });
 
 setBasemap(savedBasemap);
+
+/* =========================================================================
+ * IMPORTADOR DE GEOJSON (limites de provincias/departamentos)
+ * El color de linea se decide segun el tema del mapa base actual: blanco
+ * sobre mapas oscuros, negro sobre mapas claros. El modo "automatico" usa
+ * el flag isDark de cada BASEMAP; para Mapbox personalizado (donde no
+ * podemos saber de antemano si el estilo es oscuro o claro) el usuario
+ * puede fijar el color manualmente con el selector.
+ * ========================================================================= */
+var STORAGE_KEY_GEOJSON_COLOR_MODE = "radar_geojson_color_mode";
+var geojsonLayers = []; // { name: string, layer: L.GeoJSON, sizeBytes: number }
+var geojsonColorMode = localStorage.getItem(STORAGE_KEY_GEOJSON_COLOR_MODE) || "auto";
+
+function isCurrentBasemapDark() {
+  if (geojsonColorMode === "white") return true;
+  if (geojsonColorMode === "black") return false;
+  // modo automatico
+  if (currentBasemapKey === "mapbox_custom") return true; // no se puede saber; por defecto blanco
+  var cfg = BASEMAPS[currentBasemapKey];
+  return cfg ? !!cfg.isDark : true;
+}
+
+function boundaryStrokeColor() {
+  return isCurrentBasemapDark() ? "#ffffff" : "#000000";
+}
+
+function restyleAllGeojsonLayers() {
+  /* guard: setBasemap() puede llamar esta funcion durante la
+     inicializacion del mapa, antes de que geojsonLayers exista todavia
+     (se declara mas abajo en el archivo) */
+  if (!geojsonLayers) return;
+  var color = boundaryStrokeColor();
+  geojsonLayers.forEach(function (entry) {
+    entry.layer.setStyle({ color: color });
+  });
+}
+
+var geojsonColorModeSelect = document.getElementById("geojson-color-mode");
+geojsonColorModeSelect.value = geojsonColorMode;
+geojsonColorModeSelect.addEventListener("change", function () {
+  geojsonColorMode = geojsonColorModeSelect.value;
+  localStorage.setItem(STORAGE_KEY_GEOJSON_COLOR_MODE, geojsonColorMode);
+  restyleAllGeojsonLayers();
+});
+
+var geojsonStatusEl = document.getElementById("geojson-status");
+function setGeojsonStatus(msg, kind) {
+  geojsonStatusEl.textContent = msg;
+  geojsonStatusEl.className = kind || "";
+}
+
+var geojsonLayersListEl = document.getElementById("geojson-layers-list");
+function renderGeojsonLayersList() {
+  geojsonLayersListEl.innerHTML = "";
+  geojsonLayers.forEach(function (entry, idx) {
+    var row = document.createElement("div");
+    row.className = "geojson-layer-row";
+    var span = document.createElement("span");
+    span.textContent = entry.name;
+    span.title = entry.name;
+    var btn = document.createElement("button");
+    btn.textContent = "Quitar";
+    btn.addEventListener("click", function () {
+      map.removeLayer(entry.layer);
+      geojsonLayers.splice(idx, 1);
+      renderGeojsonLayersList();
+    });
+    row.appendChild(span);
+    row.appendChild(btn);
+    geojsonLayersListEl.appendChild(row);
+  });
+}
+
+function addGeojsonLayer(name, geojsonData) {
+  var layer = L.geoJSON(geojsonData, {
+    style: function () {
+      return {
+        color: boundaryStrokeColor(),
+        weight: 1.4,
+        opacity: 0.9,
+        fillOpacity: 0,
+        className: "admin-boundary-path"
+      };
+    }
+  }).addTo(map);
+
+  geojsonLayers.push({ name: name, layer: layer });
+  renderGeojsonLayersList();
+}
+
+document.getElementById("geojson-file").addEventListener("change", function (evt) {
+  var files = evt.target.files;
+  if (!files || !files.length) return;
+
+  var loadedCount = 0;
+  var errorCount = 0;
+
+  Array.prototype.forEach.call(files, function (file) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var data = JSON.parse(reader.result);
+        addGeojsonLayer(file.name, data);
+        loadedCount++;
+      } catch (e) {
+        errorCount++;
+        console.error("Error al parsear GeoJSON:", file.name, e);
+      } finally {
+        if (loadedCount + errorCount === files.length) {
+          if (errorCount === 0) {
+            setGeojsonStatus(loadedCount + " capa(s) importada(s) correctamente.", "ok");
+          } else {
+            setGeojsonStatus(loadedCount + " capa(s) OK, " + errorCount + " con error (revisar que sea GeoJSON valido).", "error");
+          }
+        }
+      }
+    };
+    reader.onerror = function () {
+      errorCount++;
+      setGeojsonStatus("No se pudo leer " + file.name + ".", "error");
+    };
+    reader.readAsText(file);
+  });
+
+  /* permitir volver a elegir el mismo archivo despues */
+  evt.target.value = "";
+});
 
 /* Etiquetas de ciudad, en Tahoma, independientes de la imagen del radar */
 CITIES.forEach(function (c) {
