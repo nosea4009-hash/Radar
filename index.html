@@ -319,15 +319,30 @@ function userRgbFromDbz(d) {
   return rgb[idx];
 }
 
+/* Rampa de opacidad segun intensidad: la senal muy debil/ruido (cerca del
+ * piso de la escala) se desvanece hacia transparente en vez de pintarse
+ * 100% opaca, para no tapar el mapa base con manchas del color mas oscuro
+ * de la paleta (ej. el gris casi negro de 0 dBZ en la paleta del usuario). */
+var ALPHA_FADE_FLOOR_DBZ = -10; // por debajo: totalmente transparente
+var ALPHA_FADE_CEIL_DBZ = 10;   // por encima: totalmente opaco
+
+function alphaFadeFactor(dbz) {
+  var t = (dbz - ALPHA_FADE_FLOOR_DBZ) / (ALPHA_FADE_CEIL_DBZ - ALPHA_FADE_FLOOR_DBZ);
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  return t;
+}
+
 /* Repinta una imagen (canvas) reemplazando cada pixel visible por el color
- * equivalente en la paleta del usuario, vía matching de dBZ aproximado. */
+ * equivalente en la paleta del usuario, vía matching de dBZ aproximado,
+ * y ajusta la opacidad de cada pixel segun esa misma intensidad estimada. */
 function repaintCanvasWithUserPalette(canvas) {
   var ctx = canvas.getContext("2d");
   var w = canvas.width, h = canvas.height;
   var imgData = ctx.getImageData(0, 0, w, h);
   var data = imgData.data;
 
-  /* cache simple: mismo color de entrada -> mismo color de salida,
+  /* cache simple: mismo color de entrada -> mismo resultado de salida,
      para no recalcular en cada pixel repetido */
   var cache = {};
 
@@ -340,12 +355,14 @@ function repaintCanvasWithUserPalette(canvas) {
     var out = cache[key];
     if (!out) {
       var dbz = nearestOhmcDbz(r, g, b);
-      out = userRgbFromDbz(dbz);
+      var rgb = userRgbFromDbz(dbz);
+      out = [rgb[0], rgb[1], rgb[2], alphaFadeFactor(dbz)];
       cache[key] = out;
     }
     data[i] = out[0];
     data[i + 1] = out[1];
     data[i + 2] = out[2];
+    data[i + 3] = a * out[3];
   }
 
   ctx.putImageData(imgData, 0, 0);
