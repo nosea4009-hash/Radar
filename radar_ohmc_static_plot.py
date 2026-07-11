@@ -270,7 +270,17 @@ def resolve_bbox(cfg):
 def load_departments(cfg):
     """Carga (opcionalmente) una capa de limites departamentales desde un
     archivo GeoJSON/Shapefile, usando geopandas. Devuelve None si no hay
-    path configurado o si geopandas no esta instalado."""
+    path configurado o si geopandas no esta instalado.
+
+    Repara automaticamente geometrias invalidas (ej. anillos que no
+    cierran, topologia rota) antes de devolver la capa, para evitar
+    errores tipo:
+        shapely.errors.GEOSException: IllegalArgumentException:
+        Points of LinearRing do not form a closed linestring
+    Este problema puede aparecer con datasets de límites departamentales
+    de cualquier formato (GeoJSON, Shapefile, GPKG, etc.) que tengan
+    geometrias mal formadas en el archivo de origen; no es especifico
+    de ningun formato en particular."""
     path = cfg.get("departments_path")
     if not path:
         return None
@@ -283,10 +293,38 @@ def load_departments(cfg):
     try:
         gdf = gpd.read_file(path)
         print(f"[info] Limites departamentales cargados desde '{path}' ({len(gdf)} geometrias)")
-        return gdf
     except Exception as exc:
         print(f"[warn] No se pudo leer '{path}': {exc}")
         return None
+
+    # --- Descartar geometrias nulas/vacias antes de validar ---
+    gdf = gdf[~gdf.geometry.isna() & ~gdf.geometry.is_empty]
+
+    # --- Reparar geometrias invalidas (anillos que no cierran, etc.) ---
+    invalid_mask = ~gdf.is_valid
+    n_invalid = int(invalid_mask.sum())
+    if n_invalid > 0:
+        print(f"[warn] {n_invalid} geometria(s) invalida(s) detectada(s) en '{path}'; "
+              "se intenta reparar automaticamente con make_valid().")
+        try:
+            gdf.loc[invalid_mask, "geometry"] = gdf.loc[invalid_mask, "geometry"].make_valid()
+        except AttributeError:
+            # Fallback para versiones de geopandas/shapely sin make_valid():
+            # el truco buffer(0) repara la mayoria de topologias rotas.
+            gdf.loc[invalid_mask, "geometry"] = gdf.loc[invalid_mask, "geometry"].buffer(0)
+
+        still_invalid = int((~gdf.is_valid).sum())
+        if still_invalid > 0:
+            print(f"[warn] {still_invalid} geometria(s) no se pudieron reparar; se descartan.")
+            gdf = gdf[gdf.is_valid]
+        else:
+            print("[info] Geometrias reparadas correctamente.")
+
+    if len(gdf) == 0:
+        print(f"[warn] '{path}' no tiene geometrias validas para dibujar; se omite la capa.")
+        return None
+
+    return gdf
 
 
 def compute_map_extent(cfg, bbox):
