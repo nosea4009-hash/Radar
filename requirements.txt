@@ -1,0 +1,21 @@
+# Dependencias para radar_ohmc_static_plot.py
+#
+# IMPORTANTE: se recomienda instalar estas dependencias con conda
+# (conda-forge), no con pip, porque cartopy y geopandas tienen
+# dependencias binarias (GEOS, PROJ, GDAL) que suelen fallar al
+# compilar con pip en Windows.
+#
+# Setup recomendado (Miniconda3):
+#   conda create -n radar-ohmc python=3.11 -y
+#   conda activate radar-ohmc
+#   conda install -c conda-forge cartopy matplotlib numpy requests pillow -y
+#   conda install -c conda-forge geopandas -y   # opcional, solo para limites departamentales
+#
+# Este archivo se deja como referencia / fallback por si se prefiere pip
+# en un entorno donde las dependencias binarias ya estan resueltas.
+numpy
+requests
+pillow
+matplotlib
+cartopy
+geopandas
