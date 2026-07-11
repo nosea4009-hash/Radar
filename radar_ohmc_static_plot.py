@@ -110,12 +110,62 @@ except ImportError:
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
+    import cartopy.mpl.gridliner as _cartopy_gridliner
 except ImportError:
     sys.exit(
         "Falta cartopy. Instalá con:\n"
         "  conda install -c conda-forge cartopy\n"
         "(cartopy tiene dependencias binarias: se recomienda conda, no pip)"
     )
+
+
+class _GridlinerShapelyPatch:
+    """Proxy del modulo 'shapely.geometry' usado internamente por
+    cartopy.mpl.gridliner. Delega todo al modulo real, salvo Polygon(),
+    que se envuelve para forzar el cierre exacto del anillo (primer y
+    ultimo vertice identicos) antes de construirlo.
+
+    Por que hace falta esto
+    ------------------------
+    Al dibujar una grilla de coordenadas CON ETIQUETAS (draw_labels=True),
+    cartopy recalcula en cada render el "borde" (spine) de los ejes asi:
+
+        map_boundary_path = self.axes.spines["geo"].get_path().transformed(...)
+        map_boundary = sgeom.Polygon(map_boundary_path.vertices)
+
+    Por errores de precision de punto flotante en las transformaciones
+    de coordenadas de matplotlib, el primer y el ultimo vertice de ese
+    "boundary" pueden terminar siendo CASI iguales pero no exactamente
+    iguales (ej. difieren en el ultimo decimal). Versiones viejas de
+    Shapely lo tolerauban en silencio; Shapely 2.x lo rechaza con:
+
+        shapely.errors.GEOSException: IllegalArgumentException:
+        Points of LinearRing do not form a closed linestring
+
+    Esto ocurre en CUALQUIER llamada a savefig()/show() mientras la
+    grilla tenga etiquetas activas, con o sin bbox_inches="tight" -
+    no tiene relacion con archivos de limites departamentales ni con
+    el cache de Natural Earth. Este parche solo actua sobre el modulo
+    de gridliner de cartopy; no afecta a geopandas ni a ninguna otra
+    geometria del script."""
+
+    def __init__(self, real_module):
+        self._real = real_module
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def Polygon(self, shell=None, holes=None):
+        if shell is not None:
+            coords = [tuple(pt) for pt in shell]
+            if len(coords) >= 3 and coords[0] != coords[-1]:
+                coords[-1] = coords[0]
+            shell = coords
+        return self._real.Polygon(shell, holes)
+
+
+# Aplicar el parche una sola vez, apenas se importa cartopy.
+_cartopy_gridliner.sgeom = _GridlinerShapelyPatch(_cartopy_gridliner.sgeom)
 
 
 # =============================================================================
