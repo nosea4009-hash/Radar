@@ -50,8 +50,8 @@ pasar algunos parametros por linea de comandos, por ejemplo:
 
     python radar_ohmc_static_plot.py --frame-id 903042 --colormap grc_th --output rma14.png
 
-Como conseguir el "frame_id", el "colormap" y el "bbox"
----------------------------------------------------------
+Como conseguir el "frame_id" y el "colormap"
+-----------------------------------------------
 Estos valores se consiguen inspeccionando la pestaña "Network" del
 navegador (F12) mientras se usa el visor web de OHMC:
   - "frame_id": es el "id" numerico del frame (ej: 901688, 903042),
@@ -60,14 +60,34 @@ navegador (F12) mientras se usa el visor web de OHMC:
   - "colormap": el nombre de la paleta usada en la URL de la imagen
     (ej: "grc_th", "grc_rain"), visible en las requests a
     /api/v1/frames/{id}/image.png?colormap=...
-  - "bbox": las coordenadas geograficas (min_lon, min_lat, max_lon,
-    max_lat) del radar, tambien presentes en esos mismos JSON.
 
-Como el endpoint de la imagen (.../image.png) devuelve solo el PNG (sin
-metadata), este script NO adivina el bbox: hay que completarlo a mano
-en CONFIG["radar_bbox"], o bien apuntar CONFIG["metadata_json_url"] a
-la URL de un endpoint JSON que ya hayas confirmado que contiene ese
-"bbox" para el frame elegido (el script lo busca automaticamente ahi).
+Como se resuelve el "bbox" (extension geografica del radar)
+---------------------------------------------------------------
+El endpoint de la imagen (.../image.png) devuelve solo el PNG, sin
+metadata. Por eso el bbox se resuelve en este orden de prioridad:
+
+  1. Automatico por "radar_code" (RECOMENDADO): si CONFIG["radar_code"]
+     tiene un valor (ej. "RMA2", "RMA14"), el script consulta:
+
+         GET https://webmet.ohmc.ar/api/v1/radars?active_only=true
+
+     que devuelve, para cada radar, un campo "extent" con
+     lat_min/lat_max/lon_min/lon_max. El bbox se toma de ahi
+     automaticamente: no hace falta copiar numeros a mano.
+
+  2. Manual: si CONFIG["radar_code"] es None (o no se encuentra en la
+     lista de radares activos), se usa directamente el diccionario
+     CONFIG["radar_bbox"] que hayas completado a mano (por ejemplo,
+     copiando el "bbox"/"extent" que veas en el Network tab del
+     navegador).
+
+  3. Por frame especifico (avanzado): si ademas configurás
+     CONFIG["metadata_json_url"] apuntando a un endpoint JSON que
+     incluya un campo "bbox" por frame (ej. /api/v1/cogs?product_key=...),
+     el script busca ahi el bbox exacto de ese frame_id puntual, en vez
+     del extent general del radar. Es opcional y solo tiene sentido si
+     necesitás el bbox de una observacion particular, no el del radar
+     en general (que no cambia entre observaciones).
 """
 
 import argparse
@@ -107,14 +127,21 @@ CONFIG = {
     "frame_id": 901688,
     "colormap": "grc_rain",
 
-    # --- Bbox del radar (min/max lon/lat), en grados decimales ---
-    # Completá esto a mano con el "bbox" que encontraste en el JSON de
-    # metadata de OHMC para el frame_id elegido (ver docstring arriba).
+    # --- Bbox del radar: resolucion automatica (recomendado) ---
+    # Poné el codigo del radar (ej. "RMA2", "RMA14") y el script busca
+    # su "extent" automaticamente en /api/v1/radars?active_only=true.
+    # Dejalo en None para usar "radar_bbox" (manual) en su lugar.
+    "radar_code": "RMA2",
+
+    # --- Bbox del radar (fallback manual, min/max lon/lat en grados) ---
+    # Solo se usa si "radar_code" es None o no se encuentra en la lista
+    # de radares activos. Completá esto a mano con el "extent"/"bbox"
+    # que encuentres en el Network tab del navegador.
     "radar_bbox": {
-        "min_lon": -63.76781513732091,
-        "min_lat": -38.285569273926185,
-        "max_lon": -58.37274486267906,
-        "max_lat": -34.03385620041487,
+        "min_lon": -61.14100202773579,
+        "min_lat": -36.956669988771615,
+        "max_lon": -55.890137972264206,
+        "max_lat": -32.64497001122839,
     },
 
     # Opcional: URL de un endpoint JSON de OHMC (ej. /api/v1/cogs?...
@@ -171,25 +198,72 @@ def download_radar_image(cfg):
     return arr
 
 
-def resolve_bbox(cfg):
-    """Devuelve el bbox a usar: si hay 'metadata_json_url' configurado,
-    intenta buscar el bbox del frame_id ahi; si no, usa 'radar_bbox'."""
+def fetch_radar_extent(cfg):
+    """Consulta /api/v1/radars?active_only=true y devuelve el bbox
+    (convertido desde 'extent') del radar indicado en cfg['radar_code'].
+    Devuelve None si no hay radar_code configurado, o si no se lo
+    encuentra / falla la consulta."""
+    radar_code = cfg.get("radar_code")
+    if not radar_code:
+        return None
+    url = f"{cfg['base_url']}/radars?active_only=true"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        for radar in data.get("radars", []):
+            if radar.get("code") == radar_code:
+                ext = radar["extent"]
+                print(f"[info] bbox de '{radar_code}' ({radar.get('title', '')}) "
+                      f"obtenido automaticamente desde {url}")
+                return {
+                    "min_lon": ext["lon_min"],
+                    "min_lat": ext["lat_min"],
+                    "max_lon": ext["lon_max"],
+                    "max_lat": ext["lat_max"],
+                }
+        print(f"[warn] radar_code '{radar_code}' no encontrado en {url}; "
+              "se usa 'radar_bbox' del CONFIG.")
+    except Exception as exc:
+        print(f"[warn] No se pudo consultar {url} ({exc}); "
+              "se usa 'radar_bbox' del CONFIG.")
+    return None
+
+
+def fetch_bbox_from_metadata(cfg):
+    """Busca el bbox especifico del frame_id en cfg['metadata_json_url'],
+    si esta configurado. Devuelve None si no aplica o falla."""
     url = cfg.get("metadata_json_url")
-    if url:
-        try:
-            resp = requests.get(url, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            entries = data if isinstance(data, list) else data.get("results", [data])
-            for entry in entries:
-                if entry.get("id") == cfg["frame_id"] and entry.get("bbox"):
-                    print(f"[info] bbox obtenido desde metadata_json_url para frame {cfg['frame_id']}")
-                    return entry["bbox"]
-            print("[warn] No se encontro un 'bbox' para ese frame_id en metadata_json_url; "
-                  "se usa 'radar_bbox' del CONFIG.")
-        except Exception as exc:
-            print(f"[warn] No se pudo consultar metadata_json_url ({exc}); "
-                  "se usa 'radar_bbox' del CONFIG.")
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        entries = data if isinstance(data, list) else data.get("results", [data])
+        for entry in entries:
+            if entry.get("id") == cfg["frame_id"] and entry.get("bbox"):
+                print(f"[info] bbox obtenido desde metadata_json_url para frame {cfg['frame_id']}")
+                return entry["bbox"]
+        print("[warn] No se encontro un 'bbox' para ese frame_id en metadata_json_url.")
+    except Exception as exc:
+        print(f"[warn] No se pudo consultar metadata_json_url ({exc}).")
+    return None
+
+
+def resolve_bbox(cfg):
+    """Resuelve el bbox a usar, en orden de prioridad:
+    1) metadata_json_url (bbox exacto de un frame puntual, si esta configurado)
+    2) radar_code (extent automatico desde /api/v1/radars)
+    3) radar_bbox (fallback manual del CONFIG)
+    """
+    bbox = fetch_bbox_from_metadata(cfg)
+    if bbox:
+        return bbox
+    bbox = fetch_radar_extent(cfg)
+    if bbox:
+        return bbox
+    print("[info] Usando 'radar_bbox' manual del CONFIG.")
     return cfg["radar_bbox"]
 
 
@@ -286,6 +360,9 @@ def parse_args(cfg):
     parser = argparse.ArgumentParser(description="Visualizador estatico de radar OHMC.")
     parser.add_argument("--frame-id", type=int, default=cfg["frame_id"])
     parser.add_argument("--colormap", type=str, default=cfg["colormap"])
+    parser.add_argument("--radar-code", type=str, default=cfg["radar_code"],
+                         help="Codigo de radar (ej. RMA2, RMA14) para resolver el bbox "
+                              "automaticamente desde /api/v1/radars?active_only=true.")
     parser.add_argument("--output", type=str, default=cfg["output_path"])
     parser.add_argument("--departments", type=str, default=cfg["departments_path"],
                          help="Path a un GeoJSON/Shapefile de limites departamentales.")
@@ -295,6 +372,7 @@ def parse_args(cfg):
 
     cfg["frame_id"] = args.frame_id
     cfg["colormap"] = args.colormap
+    cfg["radar_code"] = args.radar_code
     cfg["output_path"] = args.output
     cfg["departments_path"] = args.departments
     if args.no_show:
