@@ -418,6 +418,26 @@ def parse_args(cfg):
     return cfg
 
 
+def save_figure(fig, cfg):
+    """Guarda la figura, intentando primero bbox_inches='tight' (recorte
+    prolijo de margenes). Si esto dispara el bug conocido de Cartopy +
+    Matplotlib + Shapely 2.x:
+
+        shapely.errors.GEOSException: IllegalArgumentException:
+        Points of LinearRing do not form a closed linestring
+
+    (originado en cartopy/mpl/gridliner.py _draw_gridliner, al
+    recalcular el "boundary" del mapa durante el redibujado extra que
+    hace bbox_inches='tight'), se reintenta guardar SIN ese parametro,
+    que evita ese redibujado y produce un resultado casi identico."""
+    try:
+        fig.savefig(cfg["output_path"], dpi=cfg["dpi"], bbox_inches="tight")
+    except Exception as exc:
+        print(f"[warn] Fallo el guardado con bbox_inches='tight' ({exc.__class__.__name__}: {exc}).")
+        print("       Reintentando sin bbox_inches (bug conocido de Cartopy + Shapely 2.x).")
+        fig.savefig(cfg["output_path"], dpi=cfg["dpi"])
+
+
 def main():
     cfg = parse_args(CONFIG)
 
@@ -425,11 +445,20 @@ def main():
     bbox = resolve_bbox(cfg)
     fig = build_plot(radar_rgba, bbox, cfg)
 
-    fig.savefig(cfg["output_path"], dpi=cfg["dpi"], bbox_inches="tight")
+    save_figure(fig, cfg)
     print(f"[ok] Imagen guardada en: {cfg['output_path']}")
 
     if cfg.get("show_plot", True):
-        plt.show()
+        try:
+            plt.show()
+        except Exception as exc:
+            # Mismo bug de Cartopy/Shapely 2.x que puede afectar a savefig
+            # (ver save_figure) puede repetirse al mostrar la ventana
+            # interactiva, ya que tambien fuerza un redibujado. La imagen
+            # ya se guardo en disco antes de llegar aca, asi que esto solo
+            # afecta a la vista previa en pantalla, no al archivo de salida.
+            print(f"[warn] No se pudo mostrar la ventana interactiva ({exc.__class__.__name__}: {exc}).")
+            print(f"       La imagen ya fue guardada correctamente en '{cfg['output_path']}'.")
 
 
 if __name__ == "__main__":
