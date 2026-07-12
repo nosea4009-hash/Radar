@@ -102,9 +102,11 @@ El bbox se resuelve en este orden de prioridad:
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -160,6 +162,115 @@ FILTERED_PRODUCT_KEYS = {
     for entry in VARIABLE_CATALOG.values()
     if entry["filtered"]
 }
+
+# =============================================================================
+# Soporte de paletas de colores PROPIAS para la colorbar (ademas de la
+# paleta oficial de OHMC, que sigue siendo la que se usa por defecto).
+# =============================================================================
+#
+# IMPORTANTE - que SI y que NO cambia esta paleta:
+#   La imagen del radar en si (el PNG que descarga download_radar_image())
+#   viene YA COLOREADA por el servidor de OHMC segun su propio 'colormap'
+#   (grc_th, grc_rho, grc_vrad, etc.) - eso no se puede recolorear desde
+#   afuera, porque OHMC no expone los valores crudos de dBZ/m/s, solo el
+#   PNG final. Lo que SI controla este script es la COLORBAR/leyenda que
+#   se dibuja al costado (build_colorbar); "cfg['palette']" reemplaza los
+#   colores de esa leyenda por una paleta propia (ej. una de MetPy), en
+#   vez de los colores oficiales de OHMC. Sirve para tener una leyenda
+#   con una estetica distinta, pero NO cambia los colores de la imagen
+#   del radar en si.
+#
+# Fuentes de paleta soportadas en CONFIG["palette"] / --palette:
+#   - None (default): usa la paleta oficial de OHMC (colores reales de
+#     /api/v1/products -> "references"), tal como antes.
+#   - Nombre de una paleta de MetPy (ej. "NWSStormClearReflectivity",
+#     "NWS8bitVel"): requiere `pip install metpy`. Ver lista completa en
+#     https://unidata.github.io/MetPy/latest/api/generated/metpy.plots.ctables.html
+#   - Path a un archivo ".pal"/".tbl" (formato GEMPAK/MetPy: un color por
+#     linea, como tupla RGB "(r, g, b)" en 0-1, o nombre HTML, o hex).
+try:
+    import matplotlib.colors as _mcolors_for_palette
+except ImportError:
+    _mcolors_for_palette = None
+
+
+def load_metpy_palette(name):
+    """Intenta cargar una paleta por nombre desde metpy.plots.ctables.
+    Devuelve una lista de colores hex, o None si metpy no esta instalado
+    o el nombre no existe en su registry."""
+    try:
+        from metpy.plots import ctables
+    except ImportError:
+        print("[warn] No se pudo importar 'metpy' para cargar la paleta "
+              f"'{name}'. Instalá con: conda install -c conda-forge metpy "
+              "(o: pip install metpy)")
+        return None
+    if name not in ctables.registry:
+        print(f"[warn] '{name}' no es una paleta reconocida de MetPy.")
+        return None
+    raw_colors = ctables.registry[name]
+    return [_mcolors_for_palette.to_hex(c) for c in raw_colors]
+
+
+def load_pal_file_palette(path):
+    """Carga una paleta desde un archivo .pal/.tbl (formato GEMPAK/MetPy:
+    un color por linea, como tupla RGB "(r, g, b)" en 0-1, nombre HTML, o
+    hex). Reutiliza el parser de metpy si esta disponible; si no, hace un
+    parseo basico propio (solo tuplas RGB y colores hex/nombre simples)."""
+    try:
+        from metpy.plots.ctables import read_colortable
+        with open(path) as fobj:
+            raw_colors = read_colortable(fobj)
+        return [_mcolors_for_palette.to_hex(c) for c in raw_colors]
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"[warn] No se pudo leer '{path}' como tabla de colores: {exc}")
+        return None
+
+    # Fallback sin metpy: parseo linea por linea, ignorando comentarios ('#').
+    if _mcolors_for_palette is None:
+        print("[warn] Falta matplotlib para interpretar colores del archivo .pal.")
+        return None
+    colors = []
+    try:
+        with open(path) as fobj:
+            for line in fobj:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    colors.append(_mcolors_for_palette.to_hex(eval(line, {"__builtins__": {}})))
+                except Exception:
+                    continue
+    except OSError as exc:
+        print(f"[warn] No se pudo abrir '{path}': {exc}")
+        return None
+    return colors or None
+
+
+def resolve_palette_colors(cfg):
+    """Resuelve la lista de colores hex a usar en la colorbar, a partir de
+    cfg['palette']:
+    - None -> devuelve None (se usa la paleta oficial de OHMC, sin cambios)
+    - termina en .pal/.tbl, o es un path existente -> load_pal_file_palette
+    - en cualquier otro caso -> se interpreta como nombre de paleta MetPy
+    Devuelve None si no se pudo resolver (se cae de vuelta a OHMC)."""
+    palette = cfg.get("palette")
+    if not palette:
+        return None
+    p = Path(palette)
+    if p.suffix.lower() in (".pal", ".tbl") or p.is_file():
+        colors = load_pal_file_palette(palette)
+    else:
+        colors = load_metpy_palette(palette)
+    if colors:
+        print(f"[info] Paleta '{palette}' cargada ({len(colors)} colores); "
+              "se usa para la colorbar en vez de la paleta oficial de OHMC.")
+    else:
+        print(f"[warn] No se pudo resolver la paleta '{palette}'; "
+              "se usa la paleta oficial de OHMC para la colorbar.")
+    return colors
 
 try:
     import cartopy.crs as ccrs
@@ -282,6 +393,17 @@ CONFIG = {
     # referencia), consultando /api/v1/products. Se desactiva sola si
     # no hay datos suficientes (ej. producto sin 'references').
     "show_colorbar": True,
+
+    # --- Paleta CUSTOM para la colorbar (opcional) ---
+    # Si es None (default), la colorbar usa los colores OFICIALES de OHMC.
+    # Si tiene un valor, puede ser:
+    #   - Nombre de una paleta de MetPy (ej. "NWSStormClearReflectivity")
+    #   - Path a un archivo .pal/.tbl (formato GEMPAK/MetPy)
+    # IMPORTANTE: esto solo cambia la leyenda dibujada por este script, NO
+    # los colores de la imagen del radar en si (ver nota en
+    # resolve_palette_colors()). Requiere 'pip install metpy' salvo que se
+    # use un archivo .pal ya en formato compatible sin metpy instalado.
+    "palette": None,
 
     # --- Titulo ---
     # Si "title" tiene un valor fijo (no None), se usa tal cual. Si es
@@ -569,22 +691,50 @@ def build_title(cfg, frame_meta, product_info):
     return f"{radar_code} {date_str} {product_name}"
 
 
-def build_colorbar(fig, ax, product_info):
-    """Agrega al costado de la imagen la colorbar/leyenda oficial de OHMC
-    para el producto graficado, usando las 'references' (valor + color)
-    que devuelve /api/v1/products. Es una colorbar discreta (por bandas),
-    fiel a como OHMC define sus umbrales de color, no un degradado
-    continuo generico.
+def build_colorbar(fig, ax, cfg, product_info, frame_meta=None):
+    """Agrega al costado de la imagen la colorbar/leyenda del producto
+    graficado. Por defecto usa la paleta OFICIAL de OHMC (discreta, por
+    bandas, con las 'references' de /api/v1/products). Si cfg['palette']
+    resuelve a una paleta propia (MetPy o archivo .pal/.tbl, ver
+    resolve_palette_colors()), se dibuja en su lugar una colorbar
+    CONTINUA con esa paleta, sobre el rango [min_value, max_value] del
+    producto (o el vmin/vmax del frame como fallback).
 
-    Solo muestra el VALOR numerico (+ unidad) en cada marca; no se
-    incluyen las descripciones textuales de OHMC (ej. "Lluvia muy
-    intensa y granizo", "Banda brillante") a pedido del usuario, ya que
-    esas descripciones estaban pensadas para el visor web interactivo,
-    no para una leyenda de imagen estatica.
+    IMPORTANTE: esto solo cambia la leyenda dibujada por este script; NO
+    afecta a los colores de la imagen del radar en si (esa la colorea
+    OHMC en el servidor, ver nota junto a resolve_palette_colors()).
 
-    No hace nada si no hay info suficiente (por ejemplo, si
-    /api/v1/products no respondio o el producto no tiene 'references'
-    definidas)."""
+    Si se usa la paleta oficial de OHMC, solo se muestra el VALOR
+    numerico (+ unidad) en cada marca; no se incluyen las descripciones
+    textuales de OHMC (ej. "Lluvia muy intensa y granizo"), a pedido del
+    usuario.
+
+    No hace nada si no hay info suficiente en ningun caso."""
+    frame_meta = frame_meta or {}
+    custom_colors = resolve_palette_colors(cfg)
+
+    if custom_colors:
+        vmin = product_info.get("min_value")
+        vmax = product_info.get("max_value")
+        if vmin is None:
+            vmin = frame_meta.get("cog_vmin")
+        if vmax is None:
+            vmax = frame_meta.get("cog_vmax")
+        if vmin is None or vmax is None:
+            print("[warn] No hay rango [min_value, max_value] para la paleta custom; se omite la colorbar.")
+            return
+        cmap = mcolors.ListedColormap(custom_colors, name=cfg.get("palette"))
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=ax, orientation="vertical", fraction=0.045, pad=0.03)
+        unit = product_info.get("unit") or ""
+        label = cfg.get("palette", "")
+        if unit and unit != "-":
+            label += f" ({unit})" if label else unit
+        if label:
+            cbar.set_label(label, fontsize=8)
+        return
+
     references = product_info.get("references") or []
     vmax = product_info.get("max_value")
 
@@ -654,12 +804,31 @@ def load_boundary_layer(path, layer_name="capa"):
         print(f"[warn] geopandas no esta instalado; se omiten los {layer_name}.")
         print("       Instalá con: conda install -c conda-forge geopandas")
         return None
+
+    # GDAL/OGR (usado por geopandas/fiona/pyogrio para leer GeoJSON) tiene
+    # un limite de tamaño por objeto/feature (OGR_GEOJSON_MAX_OBJ_SIZE,
+    # default 200 MB), pensado para evitar cargar accidentalmente
+    # archivos corruptos. Con GeoJSON de municipios/departamentos de
+    # Argentina (muchos vertices por poligono) esto puede dispararse
+    # incluso con archivos legitimos, con un error tipo:
+    #     GeoJSON object too complex/large. You may define the
+    #     OGR_GEOJSON_MAX_OBJ_SIZE configuration option ...
+    # Por eso se desactiva el limite (valor "0") antes de leer, y se
+    # restaura el valor previo despues, para no afectar otras lecturas
+    # que puedan depender de el en el mismo proceso.
+    prev_max_obj_size = os.environ.get("OGR_GEOJSON_MAX_OBJ_SIZE")
+    os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = "0"
     try:
         gdf = gpd.read_file(path)
         print(f"[info] {layer_name.capitalize()} cargados desde '{path}' ({len(gdf)} geometrias)")
     except Exception as exc:
         print(f"[warn] No se pudo leer '{path}': {exc}")
         return None
+    finally:
+        if prev_max_obj_size is None:
+            os.environ.pop("OGR_GEOJSON_MAX_OBJ_SIZE", None)
+        else:
+            os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = prev_max_obj_size
 
     # --- Descartar geometrias nulas/vacias antes de validar ---
     gdf = gdf[~gdf.geometry.isna() & ~gdf.geometry.is_empty]
@@ -758,7 +927,7 @@ def build_plot(radar_rgba, bbox, cfg, frame_meta=None, product_info=None):
 
     # --- Colorbar del producto al costado (opcional) ---
     if cfg.get("show_colorbar", True):
-        build_colorbar(fig, ax, product_info)
+        build_colorbar(fig, ax, cfg, product_info, frame_meta=frame_meta)
 
     # --- Titulo (fijo o dinamico, ver CONFIG["title"]) ---
     title = cfg.get("title") or build_title(cfg, frame_meta, product_info)
@@ -791,6 +960,11 @@ def parse_args(cfg):
                          help="Path a un GeoJSON/Shapefile de limites departamentales.")
     parser.add_argument("--no-colorbar", action="store_true",
                          help="No dibujar la colorbar/leyenda del producto al costado.")
+    parser.add_argument("--palette", type=str, default=cfg["palette"],
+                         help="Paleta CUSTOM para la colorbar: nombre de una paleta de "
+                              "MetPy (ej. NWSStormClearReflectivity) o path a un archivo "
+                              ".pal/.tbl. Si se omite, se usa la paleta oficial de OHMC. "
+                              "NO cambia los colores de la imagen del radar en si.")
     parser.add_argument("--title", type=str, default=cfg["title"],
                          help="Titulo fijo del mapa. Si se omite, se genera "
                               "automaticamente a partir de la metadata del frame.")
@@ -806,6 +980,7 @@ def parse_args(cfg):
     cfg["provinces_path"] = args.provinces
     cfg["departments_path"] = args.departments
     cfg["title"] = args.title
+    cfg["palette"] = args.palette
     if args.no_colorbar:
         cfg["show_colorbar"] = False
     if args.no_show:

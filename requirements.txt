@@ -9,7 +9,8 @@
 #   conda create -n radar-ohmc python=3.11 -y
 #   conda activate radar-ohmc
 #   conda install -c conda-forge cartopy matplotlib numpy requests pillow -y
-#   conda install -c conda-forge geopandas -y   # opcional, solo para limites departamentales
+#   conda install -c conda-forge geopandas -y   # opcional, solo para limites provinciales/departamentales
+#   conda install -c conda-forge metpy -y       # opcional, solo para usar --palette con paletas de MetPy
 #
 # Este archivo se deja como referencia / fallback por si se prefiere pip
 # en un entorno donde las dependencias binarias ya estan resueltas.
@@ -19,3 +20,4 @@ pillow
 matplotlib
 cartopy
 geopandas
+metpy
