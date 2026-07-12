@@ -13,8 +13,11 @@ Que hace este script
    cartopy:
        - fondo (tierra) color BLANCO
        - oceano color celeste marino clarito
-       - limites departamentales opcionales, importados desde un
-         archivo GeoJSON/Shapefile (ver CONFIG mas abajo)
+       - limites provinciales y/o departamentales opcionales, importados
+         desde archivos GeoJSON/Shapefile (ver CONFIG mas abajo)
+       - colormap/leyenda del producto al costado de la imagen, con la
+         paleta oficial de OHMC (colores + valores de referencia)
+       - titulo dinamico con radar, fecha, producto y tilt (elevacion)
 3. Guarda el resultado como una imagen PNG estatica (no es un mapa web,
    no requiere navegador ni servidor: es un archivo de imagen fijo).
 
@@ -91,6 +94,7 @@ metadata. Por eso el bbox se resuelve en este orden de prioridad:
 
 import argparse
 import sys
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import numpy as np
@@ -98,12 +102,27 @@ import requests
 from PIL import Image
 
 try:
+    import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
 except ImportError:
     sys.exit(
         "Falta matplotlib. Instalá con:\n"
         "  conda install -c conda-forge matplotlib"
     )
+
+# Zona horaria de Argentina (fija, sin horario de verano desde 2009).
+ART_TZ = timezone(timedelta(hours=-3))
+
+# Nombres de producto "en criollo" que reemplazan la descripcion cruda de
+# la API de OHMC para ciertos product_key, segun lo pedido por el usuario.
+# Para cualquier otro product_key no listado aca, se usa directamente el
+# "product_description" que devuelve /api/v1/products.
+PRODUCT_NAME_OVERRIDES = {
+    "DBZH": "Factor equivalente de reflectividad",
+    "DBZHo": "Factor equivalente de reflectividad",
+    "VRAD": "Velocidad radial de dispersas lejanas al radar",
+    "VRADo": "Velocidad radial de dispersas lejanas al radar",
+}
 
 try:
     import cartopy.crs as ccrs
@@ -174,6 +193,16 @@ CONFIG = {
     "coastline_color": "#666666",
     "border_color": "#999999",
 
+    # --- Limites provinciales (opcional) ---
+    # Path a un archivo .geojson o .shp con límites de provincias
+    # (ej. descargado de datos IGN/INDEC). Si es None, no se dibuja
+    # esta capa. Se dibuja ANTES de los limites departamentales, con
+    # una linea mas gruesa, para que ambas capas se distingan si se
+    # usan juntas.
+    "provinces_path": None,
+    "provinces_color": "#555555",
+    "provinces_linewidth": 1.0,
+
     # --- Limites departamentales (opcional) ---
     # Path a un archivo .geojson o .shp con límites departamentales
     # (ej. descargado de datos IGN/INDEC). Si es None, no se dibuja
@@ -185,8 +214,22 @@ CONFIG = {
     # --- Overlay del radar ---
     "radar_opacity": 0.85,  # multiplicador extra sobre la transparencia ya presente en el PNG
 
+    # --- Colorbar del producto (opcional, activada por defecto) ---
+    # Dibuja al costado de la imagen la leyenda/escala de color oficial
+    # de OHMC para el producto graficado (colores + valores de
+    # referencia), consultando /api/v1/products. Se desactiva sola si
+    # no hay datos suficientes (ej. producto sin 'references').
+    "show_colorbar": True,
+
+    # --- Titulo ---
+    # Si "title" tiene un valor fijo (no None), se usa tal cual. Si es
+    # None (default), el titulo se genera dinamicamente con el formato:
+    #     {RADAR_CODE} {DD-MM-YYYY} {Nombre del producto} ({tilt})
+    # a partir de la metadata real del frame (/api/v1/cogs/{frame_id})
+    # y del producto (/api/v1/products). Ver build_title().
+    "title": None,
+
     # --- Salida ---
-    "title": "Radar OHMC",
     "output_path": "radar_output.png",
     "figsize": (10, 10),
     "dpi": 150,
@@ -275,32 +318,165 @@ def resolve_bbox(cfg):
     return cfg["radar_bbox"]
 
 
-def load_departments(cfg):
-    """Carga (opcionalmente) una capa de limites departamentales desde un
-    archivo GeoJSON/Shapefile, usando geopandas. Devuelve None si no hay
-    path configurado o si geopandas no esta instalado.
+def fetch_frame_metadata(cfg):
+    """Consulta /api/v1/cogs/{frame_id} y devuelve el diccionario completo
+    de metadata del frame (observation_time, elevation_angle, product_key,
+    cog_vmin, cog_vmax, radar_code, etc.). Devuelve {} si falla, en cuyo
+    caso el titulo dinamico y la colorbar usan valores por defecto."""
+    url = f"{cfg['base_url']}/cogs/{cfg['frame_id']}"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        print(f"[info] Metadata del frame {cfg['frame_id']} obtenida desde {url}")
+        return data
+    except Exception as exc:
+        print(f"[warn] No se pudo obtener metadata de {url} ({exc}); "
+              "el titulo y la colorbar usaran valores por defecto.")
+        return {}
+
+
+def fetch_product_info(cfg, product_key):
+    """Consulta /api/v1/products y devuelve el diccionario del producto
+    indicado (product_title, product_description, min_value, max_value,
+    unit, references [lista de {value, color, title}]). Devuelve {} si
+    no se encuentra o falla la consulta."""
+    if not product_key:
+        return {}
+    url = f"{cfg['base_url']}/products"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        for product in data.get("products", []):
+            if product.get("product_key") == product_key:
+                print(f"[info] Info de producto '{product_key}' obtenida desde {url}")
+                return product
+        print(f"[warn] product_key '{product_key}' no encontrado en {url}; "
+              "se omite la colorbar y se usa un nombre de producto generico.")
+    except Exception as exc:
+        print(f"[warn] No se pudo consultar {url} ({exc}).")
+    return {}
+
+
+def build_title(cfg, frame_meta, product_info):
+    """Genera el titulo dinamico del mapa con el formato pedido:
+        {RADAR_CODE} {DD-MM-YYYY} {Nombre del producto} ({tilt})
+    Ejemplos:
+        RMA5 11-07-2026 Factor equivalente de reflectividad (0.5)
+        RMA5 11-07-2026 Velocidad radial de dispersas lejanas al radar (0.5)
+    Si falta algun dato (metadata no disponible), se completa con lo que
+    haya en CONFIG/argumentos como mejor esfuerzo, en vez de fallar."""
+    radar_code = frame_meta.get("radar_code") or cfg.get("radar_code") or "RADAR"
+
+    obs_time = frame_meta.get("observation_time")
+    if obs_time:
+        try:
+            dt_utc = datetime.fromisoformat(obs_time.replace("Z", "+00:00"))
+            date_str = dt_utc.astimezone(ART_TZ).strftime("%d-%m-%Y")
+        except Exception:
+            date_str = obs_time
+    else:
+        date_str = "fecha desconocida"
+
+    product_key = frame_meta.get("product_key") or cfg.get("colormap", "")
+    product_name = PRODUCT_NAME_OVERRIDES.get(product_key)
+    if not product_name:
+        product_name = (
+            product_info.get("product_description")
+            or product_info.get("product_title")
+            or product_key
+            or "Producto desconocido"
+        )
+
+    tilt = frame_meta.get("elevation_angle")
+    if tilt is not None:
+        return f"{radar_code} {date_str} {product_name} ({tilt:g})"
+    return f"{radar_code} {date_str} {product_name}"
+
+
+def build_colorbar(fig, ax, product_info):
+    """Agrega al costado de la imagen la colorbar/leyenda oficial de OHMC
+    para el producto graficado, usando las 'references' (valor + color +
+    titulo) que devuelve /api/v1/products. Es una colorbar discreta (por
+    bandas), fiel a como OHMC define sus umbrales de color, no un
+    degradado continuo generico. No hace nada si no hay info suficiente
+    (por ejemplo, si /api/v1/products no respondio o el producto no
+    tiene 'references' definidas)."""
+    references = product_info.get("references") or []
+    vmax = product_info.get("max_value")
+
+    # Descartar referencias sin valor/color, y valores duplicados.
+    seen = set()
+    entries = []
+    for ref in references:
+        value = ref.get("value")
+        color = ref.get("color")
+        if value is None or not color or value in seen:
+            continue
+        seen.add(value)
+        entries.append((value, color, (ref.get("title") or "").strip()))
+    entries.sort(key=lambda e: e[0])
+
+    if len(entries) < 2 or vmax is None:
+        print("[info] No hay suficientes referencias de color para dibujar la colorbar; se omite.")
+        return
+
+    boundaries = [e[0] for e in entries] + [vmax]
+    colors = [e[1] for e in entries]
+    cmap = mcolors.ListedColormap(colors)
+    norm = mcolors.BoundaryNorm(boundaries, cmap.N)
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    cbar = fig.colorbar(
+        sm, ax=ax, orientation="vertical",
+        fraction=0.045, pad=0.03, boundaries=boundaries, ticks=boundaries[:-1],
+    )
+
+    unit = product_info.get("unit") or ""
+    labels = []
+    for value, _color, title in entries:
+        label = f"{value:g}"
+        if unit and unit != "-":
+            label += f" {unit}"
+        if title and title not in ("-",):
+            label += f"\n{title}"
+        labels.append(label)
+    cbar.ax.set_yticklabels(labels, fontsize=6)
+
+    legend_title = product_info.get("product_title") or product_info.get("product_description") or ""
+    if legend_title:
+        cbar.set_label(legend_title, fontsize=8)
+
+
+def load_boundary_layer(path, layer_name="capa"):
+    """Carga (opcionalmente) una capa de limites geograficos (provincias,
+    departamentos, etc.) desde un archivo GeoJSON/Shapefile, usando
+    geopandas. Devuelve None si no hay path configurado o si geopandas
+    no esta instalado. 'layer_name' es solo para los mensajes en
+    consola (ej. "limites departamentales", "limites provinciales").
 
     Repara automaticamente geometrias invalidas (ej. anillos que no
     cierran, topologia rota) antes de devolver la capa, para evitar
     errores tipo:
         shapely.errors.GEOSException: IllegalArgumentException:
         Points of LinearRing do not form a closed linestring
-    Este problema puede aparecer con datasets de límites departamentales
-    de cualquier formato (GeoJSON, Shapefile, GPKG, etc.) que tengan
-    geometrias mal formadas en el archivo de origen; no es especifico
-    de ningun formato en particular."""
-    path = cfg.get("departments_path")
+    Este problema puede aparecer con datasets de cualquier formato
+    (GeoJSON, Shapefile, GPKG, etc.) que tengan geometrias mal formadas
+    en el archivo de origen; no es especifico de ningun formato en
+    particular ni de un tipo de limite (provincial/departamental) en
+    especial."""
     if not path:
         return None
     try:
         import geopandas as gpd
     except ImportError:
-        print("[warn] geopandas no esta instalado; se omiten los limites departamentales.")
+        print(f"[warn] geopandas no esta instalado; se omiten los {layer_name}.")
         print("       Instalá con: conda install -c conda-forge geopandas")
         return None
     try:
         gdf = gpd.read_file(path)
-        print(f"[info] Limites departamentales cargados desde '{path}' ({len(gdf)} geometrias)")
+        print(f"[info] {layer_name.capitalize()} cargados desde '{path}' ({len(gdf)} geometrias)")
     except Exception as exc:
         print(f"[warn] No se pudo leer '{path}': {exc}")
         return None
@@ -347,7 +523,9 @@ def compute_map_extent(cfg, bbox):
     ]
 
 
-def build_plot(radar_rgba, bbox, cfg):
+def build_plot(radar_rgba, bbox, cfg, frame_meta=None, product_info=None):
+    frame_meta = frame_meta or {}
+    product_info = product_info or {}
     extent = compute_map_extent(cfg, bbox)
 
     fig = plt.figure(figsize=cfg["figsize"], dpi=cfg["dpi"])
@@ -364,15 +542,26 @@ def build_plot(radar_rgba, bbox, cfg):
     ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor=cfg["border_color"],
                     linewidth=0.6, zorder=2)
 
+    # --- Limites provinciales (opcional) ---
+    provinces = load_boundary_layer(cfg.get("provinces_path"), "limites provinciales")
+    if provinces is not None:
+        provinces.boundary.plot(
+            ax=ax,
+            transform=ccrs.PlateCarree(),
+            edgecolor=cfg["provinces_color"],
+            linewidth=cfg["provinces_linewidth"],
+            zorder=3,
+        )
+
     # --- Limites departamentales (opcional) ---
-    departments = load_departments(cfg)
+    departments = load_boundary_layer(cfg.get("departments_path"), "limites departamentales")
     if departments is not None:
         departments.boundary.plot(
             ax=ax,
             transform=ccrs.PlateCarree(),
             edgecolor=cfg["departments_color"],
             linewidth=cfg["departments_linewidth"],
-            zorder=3,
+            zorder=4,
         )
 
     # --- Overlay del radar (con su propia transparencia), encima de todo ---
@@ -387,7 +576,14 @@ def build_plot(radar_rgba, bbox, cfg):
         zorder=10,
     )
 
-    ax.set_title(cfg.get("title", "Radar OHMC"), fontsize=12)
+    # --- Colorbar del producto al costado (opcional) ---
+    if cfg.get("show_colorbar", True):
+        build_colorbar(fig, ax, product_info)
+
+    # --- Titulo (fijo o dinamico, ver CONFIG["title"]) ---
+    title = cfg.get("title") or build_title(cfg, frame_meta, product_info)
+    ax.set_title(title, fontsize=12)
+
     fig.tight_layout()
     return fig
 
@@ -400,8 +596,15 @@ def parse_args(cfg):
                          help="Codigo de radar (ej. RMA2, RMA14) para resolver el bbox "
                               "automaticamente desde /api/v1/radars?active_only=true.")
     parser.add_argument("--output", type=str, default=cfg["output_path"])
+    parser.add_argument("--provinces", type=str, default=cfg["provinces_path"],
+                         help="Path a un GeoJSON/Shapefile de limites provinciales.")
     parser.add_argument("--departments", type=str, default=cfg["departments_path"],
                          help="Path a un GeoJSON/Shapefile de limites departamentales.")
+    parser.add_argument("--no-colorbar", action="store_true",
+                         help="No dibujar la colorbar/leyenda del producto al costado.")
+    parser.add_argument("--title", type=str, default=cfg["title"],
+                         help="Titulo fijo del mapa. Si se omite, se genera "
+                              "automaticamente a partir de la metadata del frame.")
     parser.add_argument("--no-show", action="store_true",
                          help="No abrir ventana de matplotlib; solo guardar el archivo.")
     args = parser.parse_args()
@@ -410,7 +613,11 @@ def parse_args(cfg):
     cfg["colormap"] = args.colormap
     cfg["radar_code"] = args.radar_code
     cfg["output_path"] = args.output
+    cfg["provinces_path"] = args.provinces
     cfg["departments_path"] = args.departments
+    cfg["title"] = args.title
+    if args.no_colorbar:
+        cfg["show_colorbar"] = False
     if args.no_show:
         cfg["show_plot"] = False
     return cfg
@@ -441,7 +648,11 @@ def main():
 
     radar_rgba = download_radar_image(cfg)
     bbox = resolve_bbox(cfg)
-    fig = build_plot(radar_rgba, bbox, cfg)
+
+    frame_meta = fetch_frame_metadata(cfg)
+    product_info = fetch_product_info(cfg, frame_meta.get("product_key"))
+
+    fig = build_plot(radar_rgba, bbox, cfg, frame_meta=frame_meta, product_info=product_info)
 
     save_figure(fig, cfg)
     print(f"[ok] Imagen guardada en: {cfg['output_path']}")
