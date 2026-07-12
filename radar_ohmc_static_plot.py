@@ -67,10 +67,30 @@ especifica un --frame-id manual que resultara ser filtrado: en ese
 caso se detecta y se reemplaza automaticamente por el equivalente sin
 filtrar (ver resolve_frame()).
 
+Busqueda historica por fecha/hora
+-------------------------------------
+Para graficar un momento especifico del pasado (no el ultimo frame
+disponible), usa --datetime en vez de buscar el frame_id a mano:
+
+    python radar_ohmc_static_plot.py --radar-code RMA17 --variable DBZH \
+        --datetime "2026-06-25 15:00"
+
+Esto busca automaticamente el frame MAS CERCANO a esa fecha/hora
+(interpretada en HORA ARGENTINA salvo que se indique otra zona
+explicitamente, ej. "2026-06-25T18:00:00Z"), dentro de una ventana de
+tolerancia de +/-30 min (configurable con --datetime-window).
+
+IMPORTANTE: OHMC NO retiene los datos crudos indefinidamente. Se
+confirmo probando la API real que la ventana de retencion es de
+aproximadamente ~18-20 dias hacia atras desde la fecha actual (mas
+alla de eso, la busqueda no encuentra nada porque los archivos ya
+fueron purgados del sistema, no por un error de este script). Si
+pedis una fecha mas vieja que eso, vas a ver un error explicando esto.
+
 Uso avanzado (frame_id / colormap manuales)
 -----------------------------------------------
-Si necesitás un frame de una fecha/hora especifica en el pasado (no el
-ultimo disponible), podés pasar su "frame_id" manualmente:
+Si ya sabes el "frame_id" exacto que necesitas, podés pasarlo
+directamente (tiene prioridad sobre --datetime):
 
     python radar_ohmc_static_plot.py --frame-id 903042 --output rma14.png
 
@@ -195,6 +215,27 @@ COVERAGE_VOL_NR = {
     240: "01",
     450: "04",
 }
+
+# =============================================================================
+# Busqueda historica por fecha/hora (CONFIG["target_datetime"] / --datetime)
+# =============================================================================
+# OHMC permite consultar /api/v1/cogs con un rango de tiempo (start_time/
+# end_time, en UTC), lo que permite buscar frames de fechas pasadas, no
+# solo el "ultimo" disponible. Se confirmo probando la API real que la
+# retencion de datos crudos NO es indefinida: hay un corte encontrado
+# entre el 22/06/2026 (sin datos) y el 25/06/2026 (con datos), con "hoy"
+# en 11-12/07/2026. Esto da una ventana de retencion de
+# aproximadamente 17 a 20 dias hacia atras desde la fecha actual. Pedir
+# una fecha mas vieja que eso (ej. 5 meses atras) devuelve una lista
+# vacia porque esos archivos ya fueron purgados del sistema, no porque
+# el mecanismo de busqueda este mal.
+#
+# RETENTION_DAYS_ESTIMATE se usa solo para dar un mensaje de error mas
+# util (aclarando que probablemente el dato ya no exista) cuando la
+# busqueda no encuentra nada y la fecha pedida es mas vieja que esta
+# estimacion; NO se usa para bloquear la busqueda en si (siempre se
+# intenta igual, por si la retencion real es mayor a la estimada aqui).
+RETENTION_DAYS_ESTIMATE = 18
 
 # =============================================================================
 # Soporte de paletas de colores PROPIAS para la colorbar (ademas de la
@@ -359,12 +400,36 @@ CONFIG = {
     # radio fijo, visible en frame_meta["radar_coverage_m"]).
     "coverage_km": None,
 
+    # --- Busqueda historica por fecha/hora (opcional) ---
+    # Si "target_datetime" tiene un valor, se busca automaticamente el
+    # frame MAS CERCANO a esa fecha/hora (en vez del ultimo disponible).
+    # Acepta:
+    #   - Un string ISO 8601 SIN zona horaria (ej. "2026-02-18 20:30" o
+    #     "2026-02-18T20:30:00"): se interpreta en HORA ARGENTINA (ART,
+    #     UTC-3) y se convierte a UTC internamente para consultar la API.
+    #   - Un string ISO 8601 CON zona horaria explicita (ej.
+    #     "2026-02-18T23:30:00Z" o "...-03:00"): se respeta la zona
+    #     indicada, sin asumir hora argentina.
+    #   - Un objeto datetime de Python (naive = hora argentina, aware =
+    #     se respeta su tzinfo).
+    # "datetime_window_minutes" define cuanto se abre la busqueda hacia
+    # adelante/atras del momento pedido (los frames de OHMC no caen
+    # siempre en un timestamp exacto). Si no se encuentra nada dentro de
+    # esa ventana, se avisa (y si la fecha es muy vieja, se aclara que
+    # probablemente el dato ya fue purgado del sistema - ver
+    # RETENTION_DAYS_ESTIMATE). No tiene efecto si se especifica un
+    # "frame_id" manual (que tiene maxima prioridad).
+    "target_datetime": None,
+    "datetime_window_minutes": 30,
+
     # --- Frame a graficar ---
-    # Si "frame_id" es None (default), se usa automaticamente el ULTIMO
-    # frame disponible para "radar_code" + la variable elegida (consultando
+    # Si "frame_id" es None (default) y "target_datetime" tampoco esta
+    # configurado, se usa automaticamente el ULTIMO frame disponible para
+    # "radar_code" + la variable elegida (consultando
     # /api/v1/cogs?radar_code=...&product_key=...&limit=1). Si preferis un
     # frame especifico (ej. de una fecha pasada), poné su id manualmente
-    # (ver Network tab del navegador, campo "id").
+    # (ver Network tab del navegador, campo "id"), o usa "target_datetime"
+    # para buscarlo por fecha/hora en vez de por id.
     "frame_id": None,
 
     # --- Colormap (paleta visual del PNG, ej. "grc_th", "grc_rho", "grc_vrad") ---
@@ -602,18 +667,125 @@ def resolve_vol_nr(cfg):
     return vol_nr
 
 
+def parse_target_datetime(value):
+    """Convierte cfg['target_datetime'] (string ISO 8601, con o sin zona
+    horaria, o un objeto datetime) a un datetime AWARE en UTC, listo para
+    consultar la API. Reglas:
+    - str SIN zona horaria (ej. "2026-02-18 20:30", "2026-02-18T20:30:00")
+      -> se interpreta en HORA ARGENTINA (ART, UTC-3).
+    - str CON zona horaria explicita (ej. "...Z", "...-03:00") -> se
+      respeta esa zona tal cual.
+    - datetime naive (sin tzinfo) -> se interpreta en hora argentina.
+    - datetime aware (con tzinfo) -> se respeta su zona.
+    Devuelve None si 'value' es None. Lanza ValueError si el string no se
+    puede parsear (mensaje pensado para mostrarse directo al usuario)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                f"No se pudo interpretar la fecha/hora '{value}'. Usa un formato "
+                "ISO 8601, ej. '2026-02-18 20:30' (se asume hora argentina) o "
+                "'2026-02-18T23:30:00Z' (UTC explicito)."
+            )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ART_TZ)
+    return dt.astimezone(timezone.utc)
+
+
+def resolve_frame_id_by_datetime(cfg, product_key, vol_nr=None):
+    """Busca el frame MAS CERCANO a cfg['target_datetime'] (ver
+    parse_target_datetime) para cfg['radar_code'] + product_key (+ vol_nr
+    si se especifica), abriendo una ventana de +/- cfg['datetime_window_minutes']
+    alrededor del momento pedido y consultando
+    /api/v1/cogs?radar_code=...&product_key=...&start_time=...&end_time=...
+
+    Si no se encuentra nada, corta la ejecucion con un mensaje claro,
+    aclarando la posible causa (retencion de datos limitada en OHMC, ver
+    RETENTION_DAYS_ESTIMATE) cuando la fecha pedida es vieja."""
+    radar_code = cfg.get("radar_code")
+    if not radar_code:
+        sys.exit(
+            "[error] 'target_datetime' requiere tambien 'radar_code' (--radar-code), "
+            "para saber en que radar buscar."
+        )
+
+    try:
+        target_utc = parse_target_datetime(cfg["target_datetime"])
+    except ValueError as exc:
+        sys.exit(f"[error] {exc}")
+
+    window = timedelta(minutes=cfg.get("datetime_window_minutes", 30))
+    start_time = (target_utc - window).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_time = (target_utc + window).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    url = (f"{cfg['base_url']}/cogs?radar_code={radar_code}"
+           f"&product_key={product_key}&start_time={start_time}&end_time={end_time}"
+           f"&limit=200")
+    if vol_nr:
+        url += f"&vol_nr={vol_nr}"
+
+    target_art_str = target_utc.astimezone(ART_TZ).strftime("%d-%m-%Y %H:%M")
+    print(f"[info] Buscando frame mas cercano a {target_art_str} (hora ARG) "
+          f"para '{radar_code}'/'{product_key}'...")
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        cogs = resp.json().get("cogs", [])
+    except Exception as exc:
+        sys.exit(f"[error] No se pudo consultar {url} ({exc}).")
+
+    if not cogs:
+        age_days = (datetime.now(timezone.utc) - target_utc).days
+        retention_hint = ""
+        if age_days > RETENTION_DAYS_ESTIMATE:
+            retention_hint = (
+                f"\n       La fecha pedida es de hace ~{age_days} dias. Se confirmo "
+                f"probando la API que OHMC retiene los datos crudos solo unos "
+                f"~{RETENTION_DAYS_ESTIMATE} dias hacia atras desde la fecha actual "
+                "(mas alla de eso, ya no hay resultados). Es probable que el archivo "
+                "original ya haya sido purgado del sistema, sin forma de recuperarlo "
+                "via esta API."
+            )
+        sys.exit(
+            f"[error] No se encontro ningun frame para radar_code='{radar_code}' "
+            f"product_key='{product_key}' dentro de +/-{window} de {target_art_str} "
+            f"(hora ARG) en {url}.{retention_hint}"
+        )
+
+    def obs_dt(entry):
+        return datetime.fromisoformat(entry["observation_time"].replace("Z", "+00:00"))
+
+    closest = min(cogs, key=lambda c: abs((obs_dt(c) - target_utc).total_seconds()))
+    diff = obs_dt(closest) - target_utc
+    frame_id = closest["id"]
+    print(f"[info] Frame mas cercano encontrado: id={frame_id} "
+          f"({closest.get('observation_time')}, diferencia de {diff}).")
+    return frame_id
+
+
 def resolve_frame_id(cfg, product_key, vol_nr=None):
-    """Resuelve el frame_id a usar:
-    - Si cfg['frame_id'] ya tiene un valor, se respeta tal cual (pero ver
-      la salvaguarda en resolve_frame() para el caso en que apunte a una
-      variante filtrada).
-    - Si es None, se busca automaticamente el ULTIMO frame disponible para
-      cfg['radar_code'] + product_key (+ vol_nr si se especifica, para
-      elegir entre la cobertura de 240 km o 450 km; ver
-      COVERAGE_VOL_NR/cfg['coverage_km']), consultando
-      /api/v1/cogs?radar_code=...&product_key=...&limit=1[&vol_nr=...]."""
+    """Resuelve el frame_id a usar, en orden de prioridad:
+    1) cfg['frame_id'] fijo, si ya tiene un valor (pero ver la
+       salvaguarda en resolve_frame() para el caso en que apunte a una
+       variante filtrada).
+    2) cfg['target_datetime'], si esta configurado: busca el frame MAS
+       CERCANO a esa fecha/hora (ver resolve_frame_id_by_datetime()).
+    3) Si ninguno de los dos esta configurado, se busca automaticamente
+       el ULTIMO frame disponible para cfg['radar_code'] + product_key
+       (+ vol_nr si se especifica, para elegir entre la cobertura de
+       240 km o 450 km; ver COVERAGE_VOL_NR/cfg['coverage_km']),
+       consultando /api/v1/cogs?radar_code=...&product_key=...&limit=1[&vol_nr=...]."""
     if cfg.get("frame_id"):
         return cfg["frame_id"]
+
+    if cfg.get("target_datetime"):
+        return resolve_frame_id_by_datetime(cfg, product_key, vol_nr=vol_nr)
 
     radar_code = cfg.get("radar_code")
     if not radar_code:
@@ -1086,7 +1258,20 @@ def parse_args(cfg):
                               "la imagen incompleta que deja el filtro polarimetrico de OHMC.")
     parser.add_argument("--frame-id", type=int, default=cfg["frame_id"],
                          help="ID de frame especifico. Si se omite, se usa automaticamente "
-                              "el ultimo frame disponible para --radar-code + --variable.")
+                              "el ultimo frame disponible para --radar-code + --variable "
+                              "(o el mas cercano a --datetime, si se especifica).")
+    parser.add_argument("--datetime", type=str, default=cfg["target_datetime"],
+                         help="Busca el frame mas cercano a esta fecha/hora en vez del "
+                              "ultimo disponible. Formato ISO 8601, ej. '2026-02-18 20:30' "
+                              "(se asume hora ARGENTINA) o '2026-02-18T23:30:00Z' (UTC "
+                              "explicito). OHMC retiene los datos crudos solo por un "
+                              f"tiempo limitado (~{RETENTION_DAYS_ESTIMATE} dias hacia atras "
+                              "al momento de escribir esto); fechas mas viejas probablemente "
+                              "no tengan datos disponibles.")
+    parser.add_argument("--datetime-window", type=int, default=cfg["datetime_window_minutes"],
+                         help="Ventana de tolerancia en minutos (+/-) alrededor de --datetime "
+                              "para buscar el frame mas cercano. Default: "
+                              f"{cfg['datetime_window_minutes']} minutos.")
     parser.add_argument("--colormap", type=str, default=cfg["colormap"],
                          help="Colormap/paleta a forzar. Si se omite, se resuelve "
                               "automaticamente desde la metadata del frame.")
@@ -1119,6 +1304,8 @@ def parse_args(cfg):
 
     cfg["variable"] = args.variable
     cfg["frame_id"] = args.frame_id
+    cfg["target_datetime"] = args.datetime
+    cfg["datetime_window_minutes"] = args.datetime_window
     cfg["colormap"] = args.colormap
     cfg["radar_code"] = args.radar_code
     cfg["coverage_km"] = args.coverage_km
