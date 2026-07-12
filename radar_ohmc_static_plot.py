@@ -13,7 +13,6 @@ Que hace este script
    cartopy:
        - fondo (tierra) color BLANCO
        - oceano color celeste marino clarito
-       - grilla de coordenadas (lat/lon) con etiquetas
        - limites departamentales opcionales, importados desde un
          archivo GeoJSON/Shapefile (ver CONFIG mas abajo)
 3. Guarda el resultado como una imagen PNG estatica (no es un mapa web,
@@ -100,7 +99,6 @@ from PIL import Image
 
 try:
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
 except ImportError:
     sys.exit(
         "Falta matplotlib. Instalá con:\n"
@@ -110,7 +108,6 @@ except ImportError:
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
-    from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
 except ImportError:
     sys.exit(
         "Falta cartopy. Instalá con:\n"
@@ -118,27 +115,18 @@ except ImportError:
         "(cartopy tiene dependencias binarias: se recomienda conda, no pip)"
     )
 
-# NOTA sobre el error "GEOSException: ... LinearRing do not form a closed
-# linestring" con la grilla de coordenadas
-# -----------------------------------------------------------------------
-# cartopy.mpl.gridliner._draw_gridliner() (usado por ax.gridlines(...,
-# draw_labels=True)) construye, en cada render, un sgeom.Polygon a partir
-# de los vertices del "borde" (spine) de los ejes para poder ubicar las
-# etiquetas de lat/lon respecto al mapa. En ciertas combinaciones de
-# proyeccion/extension/tamaño de figura, esos vertices llegan a contener
-# NaN o valores casi-cerrados que Shapely 2.x rechaza estrictamente (a
-# diferencia de versiones previas, que los tolerauban en silencio). Un
-# intento de "cerrar" el anillo a mano (forzando el ultimo vertice igual
-# al primero) NO alcanza a resolverlo cuando el problema es NaN, porque
-# NaN nunca es igual a NaN.
-#
-# La solucion robusta es evitar ese camino de codigo por completo: en vez
-# de usar draw_labels=True (que dispara el motor de etiquetas nuevo de
-# cartopy >= 0.23), se dibujan las gridlines SIN etiquetas automaticas, y
-# las etiquetas de lat/lon se agregan a mano con set_xticks/set_yticks +
-# formatters de cartopy (LongitudeFormatter/LatitudeFormatter). Esta es
-# la tecnica clasica recomendada para proyecciones rectangulares como
-# PlateCarree, y no pasa por el codigo de gridliner que esta fallando.
+# NOTA: este script NO dibuja una grilla de coordenadas (lineas/etiquetas
+# de lat/lon). Se probaron varios enfoques (cerrar el anillo del borde
+# del mapa a mano, evitar draw_labels=True usando set_xticks/set_yticks),
+# pero el motor de gridliner de cartopy sigue disparando, en algunos
+# entornos, el error:
+#     shapely.errors.GEOSException: IllegalArgumentException:
+#     Points of LinearRing do not form a closed linestring
+# Como la grilla de coordenadas no es indispensable para el resultado
+# final, se opto por quitarla directamente en vez de seguir peleando
+# contra este problema de compatibilidad entre versiones de cartopy y
+# shapely. El resto del mapa (fondo blanco, oceano celeste, limites
+# departamentales opcionales, overlay del radar) no se ve afectado.
 
 
 # =============================================================================
@@ -179,9 +167,6 @@ CONFIG = {
     # (ej. todo el pais), poné algo como [-75, -53, -56, -21].
     "map_extent": None,
     "extent_margin_deg": 1.5,
-
-    # --- Grilla de coordenadas ---
-    "grid_step_deg": 2.0,
 
     # --- Colores del mapa base ---
     "land_color": "#FFFFFF",       # tierra: blanco
@@ -389,33 +374,6 @@ def build_plot(radar_rgba, bbox, cfg):
             linewidth=cfg["departments_linewidth"],
             zorder=3,
         )
-
-    # --- Grilla de coordenadas ---
-    # NOTA: se dibuja la grilla SIN draw_labels=True (ver comentario junto
-    # a los imports de cartopy, al inicio del archivo, para el detalle del
-    # error que esto evita). Las lineas se dibujan igual con
-    # ax.gridlines(); las etiquetas de lat/lon se agregan a mano abajo
-    # con set_xticks/set_yticks, que es la tecnica clasica de cartopy para
-    # proyecciones rectangulares (PlateCarree) y no pasa por el motor de
-    # etiquetas nuevo de gridliner que dispara el GEOSException.
-    ax.gridlines(
-        draw_labels=False, linestyle="--", linewidth=0.5,
-        color="gray", alpha=0.6, zorder=4,
-        xlocs=mticker.MultipleLocator(cfg["grid_step_deg"]),
-        ylocs=mticker.MultipleLocator(cfg["grid_step_deg"]),
-    )
-
-    lon_min, lon_max, lat_min, lat_max = extent
-    step = cfg["grid_step_deg"]
-    xticks = np.arange(
-        np.ceil(lon_min / step) * step, lon_max + step / 2, step)
-    yticks = np.arange(
-        np.ceil(lat_min / step) * step, lat_max + step / 2, step)
-    ax.set_xticks(xticks, crs=ccrs.PlateCarree())
-    ax.set_yticks(yticks, crs=ccrs.PlateCarree())
-    ax.xaxis.set_major_formatter(LongitudeFormatter())
-    ax.yaxis.set_major_formatter(LatitudeFormatter())
-    ax.tick_params(labelsize=8)
 
     # --- Overlay del radar (con su propia transparencia), encima de todo ---
     radar_rgba = radar_rgba.copy()
