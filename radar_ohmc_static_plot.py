@@ -42,54 +42,63 @@ La primera vez que corras el script, cartopy va a descargar de internet
 los shapefiles de costa/fronteras de Natural Earth (una sola vez, se
 cachean localmente).
 
-Uso basico
-----------
-    python radar_ohmc_static_plot.py
+Uso basico (RECOMENDADO: por variable + radar)
+------------------------------------------------
+    python radar_ohmc_static_plot.py --radar-code RMA5 --variable DBZH
 
-Para cambiar el radar/producto/colormap, o el path a los limites
-departamentales, editá la seccion CONFIG mas abajo. Tambien podés
-pasar algunos parametros por linea de comandos, por ejemplo:
+Esto descarga automaticamente el ULTIMO frame disponible de RMA5 para
+"Z@0.5" (factor equivalente de reflectividad), usando SIEMPRE la
+variante SIN FILTRAR ("DBZHo"), resuelve su colormap/bbox reales, y
+genera el mapa con colorbar y titulo dinamico.
 
-    python radar_ohmc_static_plot.py --frame-id 903042 --colormap grc_th --output rma14.png
+Variables disponibles (--variable, ver VARIABLE_CATALOG mas abajo):
+    COLMAX, DBZH, VRAD, RHOHV, KDP, ZDR, WRAD
 
-Como conseguir el "frame_id" y el "colormap"
+Por que SIEMPRE se usa la variante sin filtrar
+-------------------------------------------------
+OHMC ofrece, para varios productos, una variante "filtrada" (sin
+sufijo, ej. "DBZH") que aplica un filtro polarimetrico (RHOHV > 0.87 y
+DBZH > 30 dBZ) para limpiar ecos no meteorologicos en el visor web
+interactivo. Ese filtro descarta directamente todo lo que este por
+debajo de esos umbrales, lo que deja "huecos"/una imagen incompleta si
+se usa para un mapa estatico. Por eso este script resuelve siempre la
+variante SIN FILTRAR (con sufijo 'o', ej. "DBZHo"), incluso si se
+especifica un --frame-id manual que resultara ser filtrado: en ese
+caso se detecta y se reemplaza automaticamente por el equivalente sin
+filtrar (ver resolve_frame()).
+
+Uso avanzado (frame_id / colormap manuales)
 -----------------------------------------------
-Estos valores se consiguen inspeccionando la pestaña "Network" del
-navegador (F12) mientras se usa el visor web de OHMC:
-  - "frame_id": es el "id" numerico del frame (ej: 901688, 903042),
-    visible en las respuestas JSON de endpoints como
-    /api/v1/latest?radar_code=... o /api/v1/cogs?product_key=...
-  - "colormap": el nombre de la paleta usada en la URL de la imagen
-    (ej: "grc_th", "grc_rain"), visible en las requests a
-    /api/v1/frames/{id}/image.png?colormap=...
+Si necesitás un frame de una fecha/hora especifica en el pasado (no el
+ultimo disponible), podés pasar su "frame_id" manualmente:
+
+    python radar_ohmc_static_plot.py --frame-id 903042 --output rma14.png
+
+El "frame_id" se consigue inspeccionando la pestaña "Network" del
+navegador (F12) mientras se usa el visor web de OHMC: es el "id"
+numerico del frame (ej: 901688, 903042), visible en las respuestas
+JSON de endpoints como /api/v1/latest?radar_code=... o
+/api/v1/cogs?product_key=.... El "colormap" (paleta) normalmente NO
+hace falta especificarlo a mano: se resuelve solo desde la metadata
+real del frame ("cog_cmap").
 
 Como se resuelve el "bbox" (extension geografica del radar)
 ---------------------------------------------------------------
-El endpoint de la imagen (.../image.png) devuelve solo el PNG, sin
-metadata. Por eso el bbox se resuelve en este orden de prioridad:
+El bbox se resuelve en este orden de prioridad:
 
-  1. Automatico por "radar_code" (RECOMENDADO): si CONFIG["radar_code"]
-     tiene un valor (ej. "RMA2", "RMA14"), el script consulta:
+  1. Automatico por frame especifico (RECOMENDADO, por defecto): el
+     bbox real del frame que se esta graficando, obtenido de
+     /api/v1/cogs/{frame_id}. Esto es importante porque distintos
+     productos pueden tener una cobertura distinta para el mismo radar
+     (ej. VRAD suele cubrir un radio menor que COLMAX).
 
-         GET https://webmet.ohmc.ar/api/v1/radars?active_only=true
+  2. Por radar_code (extent general): si por algun motivo no se pudo
+     obtener el bbox del frame, se usa el extent general del radar
+     (CONFIG["radar_code"]), consultando
+     GET https://webmet.ohmc.ar/api/v1/radars?active_only=true
 
-     que devuelve, para cada radar, un campo "extent" con
-     lat_min/lat_max/lon_min/lon_max. El bbox se toma de ahi
-     automaticamente: no hace falta copiar numeros a mano.
-
-  2. Manual: si CONFIG["radar_code"] es None (o no se encuentra en la
-     lista de radares activos), se usa directamente el diccionario
-     CONFIG["radar_bbox"] que hayas completado a mano (por ejemplo,
-     copiando el "bbox"/"extent" que veas en el Network tab del
-     navegador).
-
-  3. Por frame especifico (avanzado): si ademas configurás
-     CONFIG["metadata_json_url"] apuntando a un endpoint JSON que
-     incluya un campo "bbox" por frame (ej. /api/v1/cogs?product_key=...),
-     el script busca ahi el bbox exacto de ese frame_id puntual, en vez
-     del extent general del radar. Es opcional y solo tiene sentido si
-     necesitás el bbox de una observacion particular, no el del radar
-     en general (que no cambia entre observaciones).
+  3. Manual: como ultimo fallback, se usa el diccionario
+     CONFIG["radar_bbox"] completado a mano.
 """
 
 import argparse
@@ -124,6 +133,34 @@ PRODUCT_NAME_OVERRIDES = {
     "VRADo": "Velocidad radial de dispersas lejanas al radar",
 }
 
+# Catalogo de "variables" seleccionables por nombre amigable (CONFIG["variable"]
+# / --variable), con su product_key SIN FILTRAR (el que se usa siempre, ver
+# resolve_product_key) y, si existe, el product_key FILTRADO equivalente
+# (usado solo para detectar y corregir automaticamente el caso en que un
+# --frame-id manual apunte a la variante filtrada; ver resolve_frame).
+#
+# IMPORTANTE: RHOHV y VRAD no tienen variante filtrada en la API de OHMC
+# (solo existen como "RHOHVo"/"VRADo"); para esos casos "filtered" es None.
+VARIABLE_CATALOG = {
+    "COLMAX": {"unfiltered": "COLMAXo", "filtered": "COLMAX"},
+    "DBZH": {"unfiltered": "DBZHo", "filtered": "DBZH"},      # Z@0.5 / Factor equivalente de reflectividad
+    "VRAD": {"unfiltered": "VRADo", "filtered": None},        # Velocidad radial (Doppler)
+    "RHOHV": {"unfiltered": "RHOHVo", "filtered": None},      # Coeficiente de correlacion co-polar
+    "KDP": {"unfiltered": "KDPo", "filtered": "KDP"},         # Diferencial de fase especifico
+    "ZDR": {"unfiltered": "ZDRo", "filtered": "ZDR"},         # Reflectividad diferencial
+    "WRAD": {"unfiltered": "WRADo", "filtered": None},        # Ancho espectral
+}
+
+# Mapeo inverso (filtrado -> sin filtrar), derivado de VARIABLE_CATALOG.
+# Se usa como salvaguarda: si en algun momento se termina resolviendo un
+# frame cuyo product_key real es una de estas claves FILTRADAS, el script
+# descarta ese frame y busca automaticamente el equivalente sin filtrar.
+FILTERED_PRODUCT_KEYS = {
+    entry["filtered"]: entry["unfiltered"]
+    for entry in VARIABLE_CATALOG.values()
+    if entry["filtered"]
+}
+
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -154,8 +191,33 @@ except ImportError:
 CONFIG = {
     # --- Fuente del radar (API OHMC) ---
     "base_url": "https://webmet.ohmc.ar/api/v1",
-    "frame_id": 901688,
-    "colormap": "grc_rain",
+
+    # --- Variable a graficar (RECOMENDADO usar esto en vez de frame_id/colormap) ---
+    # Nombre amigable de la variable. Opciones validas (ver VARIABLE_CATALOG):
+    #     "COLMAX" (reflectividad columna maxima), "DBZH" (Z@0.5, factor
+    #     equivalente de reflectividad), "VRAD" (velocidad radial Doppler),
+    #     "RHOHV" (coeficiente de correlacion co-polar), "KDP", "ZDR", "WRAD"
+    # IMPORTANTE: el script SIEMPRE usa la variante SIN FILTRAR del producto
+    # elegido (ej. "COLMAXo", "DBZHo", "VRADo"), nunca la filtrada. El
+    # filtrado polarimetrico de OHMC descarta todo por debajo de ~30 dBZ
+    # (ver RHOHV>0.87 y DBZH>30 en el visor web), lo que hace que la imagen
+    # se vea "rara"/incompleta para varios usos. Ver resolve_product_key().
+    "variable": "COLMAX",
+
+    # --- Frame a graficar ---
+    # Si "frame_id" es None (default), se usa automaticamente el ULTIMO
+    # frame disponible para "radar_code" + la variable elegida (consultando
+    # /api/v1/cogs?radar_code=...&product_key=...&limit=1). Si preferis un
+    # frame especifico (ej. de una fecha pasada), poné su id manualmente
+    # (ver Network tab del navegador, campo "id").
+    "frame_id": None,
+
+    # --- Colormap (paleta visual del PNG, ej. "grc_th", "grc_rho", "grc_vrad") ---
+    # Si es None (default), se resuelve automaticamente a partir de la
+    # metadata real del frame ("cog_cmap", que ya viene ligado al tipo de
+    # producto). Fijalo a un valor manual solo si querés forzar una paleta
+    # distinta a la que usa OHMC por defecto para ese producto.
+    "colormap": None,
 
     # --- Bbox del radar: resolucion automatica (recomendado) ---
     # Poné el codigo del radar (ej. "RMA2", "RMA14") y el script busca
@@ -302,12 +364,22 @@ def fetch_bbox_from_metadata(cfg):
     return None
 
 
-def resolve_bbox(cfg):
+def resolve_bbox(cfg, frame_meta=None):
     """Resuelve el bbox a usar, en orden de prioridad:
-    1) metadata_json_url (bbox exacto de un frame puntual, si esta configurado)
-    2) radar_code (extent automatico desde /api/v1/radars)
-    3) radar_bbox (fallback manual del CONFIG)
+    1) bbox real del frame especifico (frame_meta["bbox"], desde
+       /api/v1/cogs/{frame_id} - RECOMENDADO: cada producto puede tener
+       una cobertura distinta, ej. VRAD suele cubrir un radio menor que
+       COLMAX para el mismo radar, asi que el extent general del radar
+       puede quedar mal ajustado si se usa para cualquier producto)
+    2) metadata_json_url (bbox de un frame puntual, si esta configurado
+       manualmente; mantiene compatibilidad con configuraciones previas)
+    3) radar_code (extent general del radar, desde /api/v1/radars)
+    4) radar_bbox (fallback manual del CONFIG)
     """
+    frame_meta = frame_meta or {}
+    if frame_meta.get("bbox"):
+        print(f"[info] bbox tomado de la metadata real del frame {cfg['frame_id']}.")
+        return frame_meta["bbox"]
     bbox = fetch_bbox_from_metadata(cfg)
     if bbox:
         return bbox
@@ -316,6 +388,108 @@ def resolve_bbox(cfg):
         return bbox
     print("[info] Usando 'radar_bbox' manual del CONFIG.")
     return cfg["radar_bbox"]
+
+
+def resolve_product_key(cfg):
+    """Resuelve el product_key SIN FILTRAR a usar, a partir del nombre
+    amigable en cfg['variable'] (ver VARIABLE_CATALOG). Siempre devuelve
+    la variante sin filtrar (ej. 'COLMAXo', 'DBZHo', 'VRADo', 'RHOHVo'),
+    nunca la filtrada, para evitar la imagen "rara"/incompleta que deja
+    el filtro polarimetrico de OHMC (corta todo por debajo de ~30 dBZ /
+    RHOHV<0.87). Si 'variable' no esta en el catalogo, se avisa y se cae
+    de vuelta a 'COLMAXo' como default seguro."""
+    variable = (cfg.get("variable") or "COLMAX").upper()
+    entry = VARIABLE_CATALOG.get(variable)
+    if entry is None:
+        print(f"[warn] variable '{variable}' no reconocida; opciones validas: "
+              f"{', '.join(VARIABLE_CATALOG)}. Se usa 'COLMAX' (COLMAXo) por defecto.")
+        entry = VARIABLE_CATALOG["COLMAX"]
+    return entry["unfiltered"]
+
+
+def resolve_frame_id(cfg, product_key):
+    """Resuelve el frame_id a usar:
+    - Si cfg['frame_id'] ya tiene un valor, se respeta tal cual (pero ver
+      la salvaguarda en resolve_frame() para el caso en que apunte a una
+      variante filtrada).
+    - Si es None, se busca automaticamente el ULTIMO frame disponible para
+      cfg['radar_code'] + product_key, consultando
+      /api/v1/cogs?radar_code=...&product_key=...&limit=1."""
+    if cfg.get("frame_id"):
+        return cfg["frame_id"]
+
+    radar_code = cfg.get("radar_code")
+    if not radar_code:
+        sys.exit(
+            "[error] No se especifico 'frame_id' ni 'radar_code'; no hay forma "
+            "de saber que frame descargar. Especifica al menos uno de los dos "
+            "(--radar-code RMA5, por ejemplo)."
+        )
+
+    url = (f"{cfg['base_url']}/cogs?radar_code={radar_code}"
+           f"&product_key={product_key}&limit=1")
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        cogs = resp.json().get("cogs", [])
+        if not cogs:
+            sys.exit(
+                f"[error] No se encontro ningun frame reciente para "
+                f"radar_code='{radar_code}' product_key='{product_key}' en {url}. "
+                "Verifica que el radar este activo y que la variable tenga datos."
+            )
+        frame_id = cogs[0]["id"]
+        print(f"[info] Ultimo frame de '{radar_code}'/'{product_key}': "
+              f"id={frame_id} ({cogs[0].get('observation_time')})")
+        return frame_id
+    except SystemExit:
+        raise
+    except Exception as exc:
+        sys.exit(f"[error] No se pudo consultar {url} ({exc}).")
+
+
+def resolve_frame(cfg):
+    """Punto de entrada unico para resolver que frame_id/colormap se van a
+    descargar, aplicando la salvaguarda anti-filtrado pedida por el
+    usuario. Devuelve (frame_id, colormap, frame_meta).
+
+    Logica:
+    1) Se resuelve el product_key SIN FILTRAR deseado (resolve_product_key).
+    2) Se resuelve el frame_id (automatico o manual).
+    3) Se consulta la metadata real de ese frame_id
+       (/api/v1/cogs/{frame_id}). Si el product_key real del frame
+       resultara ser una variante FILTRADA (ej. el usuario paso un
+       --frame-id manual que en realidad corresponde a 'DBZH' en vez de
+       'DBZHo'), se avisa y se reintenta automaticamente buscando el
+       frame sin filtrar equivalente (mismo radar, misma variable) en vez
+       de graficar la version filtrada."""
+    product_key = resolve_product_key(cfg)
+    frame_id = resolve_frame_id(cfg, product_key)
+    cfg["frame_id"] = frame_id
+
+    frame_meta = fetch_frame_metadata(cfg)
+    real_key = frame_meta.get("product_key")
+
+    is_filtered = (
+        real_key and real_key in FILTERED_PRODUCT_KEYS
+    )
+    if is_filtered:
+        print(f"[warn] El frame {frame_id} corresponde a '{real_key}', que es una "
+              "variante FILTRADA de OHMC (descarta datos por debajo de ~30 dBZ / "
+              "RHOHV<0.87). Se busca automaticamente el frame SIN FILTRAR "
+              "equivalente en su lugar.")
+        cfg["frame_id"] = None  # forzar re-resolucion automatica
+        unfiltered_key = FILTERED_PRODUCT_KEYS.get(real_key, product_key)
+        frame_id = resolve_frame_id(cfg, unfiltered_key)
+        cfg["frame_id"] = frame_id
+        frame_meta = fetch_frame_metadata(cfg)
+
+    colormap = cfg.get("colormap") or frame_meta.get("cog_cmap") or "grc_th"
+    if not cfg.get("colormap"):
+        print(f"[info] colormap resuelto automaticamente desde la metadata: '{colormap}'")
+    cfg["colormap"] = colormap
+
+    return frame_id, colormap, frame_meta
 
 
 def fetch_frame_metadata(cfg):
@@ -397,12 +571,20 @@ def build_title(cfg, frame_meta, product_info):
 
 def build_colorbar(fig, ax, product_info):
     """Agrega al costado de la imagen la colorbar/leyenda oficial de OHMC
-    para el producto graficado, usando las 'references' (valor + color +
-    titulo) que devuelve /api/v1/products. Es una colorbar discreta (por
-    bandas), fiel a como OHMC define sus umbrales de color, no un
-    degradado continuo generico. No hace nada si no hay info suficiente
-    (por ejemplo, si /api/v1/products no respondio o el producto no
-    tiene 'references' definidas)."""
+    para el producto graficado, usando las 'references' (valor + color)
+    que devuelve /api/v1/products. Es una colorbar discreta (por bandas),
+    fiel a como OHMC define sus umbrales de color, no un degradado
+    continuo generico.
+
+    Solo muestra el VALOR numerico (+ unidad) en cada marca; no se
+    incluyen las descripciones textuales de OHMC (ej. "Lluvia muy
+    intensa y granizo", "Banda brillante") a pedido del usuario, ya que
+    esas descripciones estaban pensadas para el visor web interactivo,
+    no para una leyenda de imagen estatica.
+
+    No hace nada si no hay info suficiente (por ejemplo, si
+    /api/v1/products no respondio o el producto no tiene 'references'
+    definidas)."""
     references = product_info.get("references") or []
     vmax = product_info.get("max_value")
 
@@ -415,7 +597,7 @@ def build_colorbar(fig, ax, product_info):
         if value is None or not color or value in seen:
             continue
         seen.add(value)
-        entries.append((value, color, (ref.get("title") or "").strip()))
+        entries.append((value, color))
     entries.sort(key=lambda e: e[0])
 
     if len(entries) < 2 or vmax is None:
@@ -435,14 +617,12 @@ def build_colorbar(fig, ax, product_info):
 
     unit = product_info.get("unit") or ""
     labels = []
-    for value, _color, title in entries:
+    for value, _color in entries:
         label = f"{value:g}"
         if unit and unit != "-":
             label += f" {unit}"
-        if title and title not in ("-",):
-            label += f"\n{title}"
         labels.append(label)
-    cbar.ax.set_yticklabels(labels, fontsize=6)
+    cbar.ax.set_yticklabels(labels, fontsize=7)
 
     legend_title = product_info.get("product_title") or product_info.get("product_description") or ""
     if legend_title:
@@ -590,8 +770,17 @@ def build_plot(radar_rgba, bbox, cfg, frame_meta=None, product_info=None):
 
 def parse_args(cfg):
     parser = argparse.ArgumentParser(description="Visualizador estatico de radar OHMC.")
-    parser.add_argument("--frame-id", type=int, default=cfg["frame_id"])
-    parser.add_argument("--colormap", type=str, default=cfg["colormap"])
+    parser.add_argument("--variable", type=str, default=cfg["variable"],
+                         choices=list(VARIABLE_CATALOG),
+                         help="Variable a graficar. El script SIEMPRE usa la variante "
+                              "SIN FILTRAR (ej. --variable DBZH usa 'DBZHo'), para evitar "
+                              "la imagen incompleta que deja el filtro polarimetrico de OHMC.")
+    parser.add_argument("--frame-id", type=int, default=cfg["frame_id"],
+                         help="ID de frame especifico. Si se omite, se usa automaticamente "
+                              "el ultimo frame disponible para --radar-code + --variable.")
+    parser.add_argument("--colormap", type=str, default=cfg["colormap"],
+                         help="Colormap/paleta a forzar. Si se omite, se resuelve "
+                              "automaticamente desde la metadata del frame.")
     parser.add_argument("--radar-code", type=str, default=cfg["radar_code"],
                          help="Codigo de radar (ej. RMA2, RMA14) para resolver el bbox "
                               "automaticamente desde /api/v1/radars?active_only=true.")
@@ -609,6 +798,7 @@ def parse_args(cfg):
                          help="No abrir ventana de matplotlib; solo guardar el archivo.")
     args = parser.parse_args()
 
+    cfg["variable"] = args.variable
     cfg["frame_id"] = args.frame_id
     cfg["colormap"] = args.colormap
     cfg["radar_code"] = args.radar_code
@@ -646,10 +836,14 @@ def save_figure(fig, cfg):
 def main():
     cfg = parse_args(CONFIG)
 
-    radar_rgba = download_radar_image(cfg)
-    bbox = resolve_bbox(cfg)
+    # Resuelve frame_id/colormap (automatico por variable + radar_code, o
+    # manual si se especifico --frame-id), aplicando la salvaguarda que
+    # evita graficar variantes FILTRADAS de OHMC (ver resolve_frame()).
+    frame_id, colormap, frame_meta = resolve_frame(cfg)
 
-    frame_meta = fetch_frame_metadata(cfg)
+    radar_rgba = download_radar_image(cfg)
+    bbox = resolve_bbox(cfg, frame_meta=frame_meta)
+
     product_info = fetch_product_info(cfg, frame_meta.get("product_key"))
 
     fig = build_plot(radar_rgba, bbox, cfg, frame_meta=frame_meta, product_info=product_info)
