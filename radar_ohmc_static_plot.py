@@ -163,6 +163,39 @@ FILTERED_PRODUCT_KEYS = {
     if entry["filtered"]
 }
 
+# Mapeo sin filtrar -> filtrado (el sentido opuesto al de arriba). Se usa
+# UNICAMENTE para resolver la leyenda/colorbar (ver ensure_colorbar_references()):
+# algunos productos "sin filtrar" (ej. "COLMAXo", "DBZHo") vienen con
+# 'references' VACIO en /api/v1/products (la paleta de colores oficial no
+# esta definida ahi), mientras que su variante FILTRADA equivalente
+# ("COLMAX", "DBZH") si trae la lista completa de colores/valores. Como
+# ambas variantes usan la MISMA escala de color (mismo cog_cmap, mismo
+# min_value/max_value), es seguro "prestarle" esas referencias a la
+# variante sin filtrar solo para dibujar la colorbar, sin afectar en nada
+# la imagen del radar en si (que sigue siendo siempre la sin filtrar).
+UNFILTERED_TO_FILTERED_KEYS = {
+    entry["unfiltered"]: entry["filtered"]
+    for entry in VARIABLE_CATALOG.values()
+    if entry["filtered"]
+}
+
+# =============================================================================
+# Cobertura/radio del radar (240 km vs 450 km aprox.)
+# =============================================================================
+# OHMC genera, para el mismo radar y variable, distintos "volumenes"
+# (vol_nr) segun la estrategia de barrido, cada uno con un radio de
+# cobertura distinto. Se confirmo contra la API real (/api/v1/cogs?...)
+# que:
+#   vol_nr="01" -> radar_coverage_m ~236 km (etiquetado aqui como "240")
+#   vol_nr="04" -> radar_coverage_m ~446 km (etiquetado aqui como "450")
+# Los numeros "240"/"450" son etiquetas redondeadas para el usuario; el
+# radio real exacto depende del radar y se toma siempre de la metadata
+# real del frame (frame_meta["radar_coverage_m"]), no de esta tabla.
+COVERAGE_VOL_NR = {
+    240: "01",
+    450: "04",
+}
+
 # =============================================================================
 # Soporte de paletas de colores PROPIAS para la colorbar (ademas de la
 # paleta oficial de OHMC, que sigue siendo la que se usa por defecto).
@@ -315,6 +348,17 @@ CONFIG = {
     # se vea "rara"/incompleta para varios usos. Ver resolve_product_key().
     "variable": "COLMAX",
 
+    # --- Cobertura del radar: 240 km vs 450 km (opcional) ---
+    # Varios radares (ej. RMA5) tienen dos "volumenes" (vol_nr) con radio
+    # de cobertura distinto para el mismo producto: uno de ~240 km y otro
+    # de ~450 km (ver COVERAGE_VOL_NR). Si "coverage_km" es None (default),
+    # se usa el comportamiento por defecto de OHMC (el primer resultado
+    # que devuelva /api/v1/cogs, sin forzar ningun vol_nr en particular).
+    # Poné 240 o 450 para forzar una cobertura especifica. No tiene efecto
+    # si se especifica un "frame_id" manual (ese frame ya tiene su propio
+    # radio fijo, visible en frame_meta["radar_coverage_m"]).
+    "coverage_km": None,
+
     # --- Frame a graficar ---
     # Si "frame_id" es None (default), se usa automaticamente el ULTIMO
     # frame disponible para "radar_code" + la variable elegida (consultando
@@ -355,9 +399,21 @@ CONFIG = {
 
     # --- Extensión del mapa (area visible) ---
     # Si "map_extent" es None, se calcula automaticamente a partir del
-    # bbox del radar + un margen (en grados). Si querés un area fija
-    # (ej. todo el pais), poné algo como [-75, -53, -56, -21].
+    # bbox del radar + un margen. Si querés un area fija (ej. todo el
+    # pais), poné algo como [-75, -53, -56, -21].
     "map_extent": None,
+
+    # El margen se calcula como PORCENTAJE del ancho/alto del bbox del
+    # frame (en vez de un valor fijo en grados), para que el zoom quede
+    # proporcional sin importar si el radar cubre 240 km o 450 km: con un
+    # margen fijo en grados, la cobertura de 240 km (bbox mas chico)
+    # terminaba viendose con MAS margen relativo (mas "alejada") que la
+    # de 450 km, al reves de lo esperado. "extent_margin_pct" (0.08 =
+    # 8% del ancho/alto del bbox) resuelve esto: cada cobertura queda
+    # encuadrada con el mismo nivel de zoom relativo. "extent_margin_deg"
+    # se mantiene como fallback fijo por si se prefiere el comportamiento
+    # anterior (poné extent_margin_pct=None para usarlo).
+    "extent_margin_pct": 0.08,
     "extent_margin_deg": 1.5,
 
     # --- Colores del mapa base ---
@@ -529,14 +585,33 @@ def resolve_product_key(cfg):
     return entry["unfiltered"]
 
 
-def resolve_frame_id(cfg, product_key):
+def resolve_vol_nr(cfg):
+    """Resuelve el 'vol_nr' a pasarle a /api/v1/cogs a partir de
+    cfg['coverage_km'] (240 o 450), usando COVERAGE_VOL_NR. Devuelve None
+    si cfg['coverage_km'] no esta configurado (comportamiento por defecto
+    de OHMC, sin forzar ninguna cobertura en particular) o si el valor no
+    es reconocido (240/450)."""
+    coverage_km = cfg.get("coverage_km")
+    if not coverage_km:
+        return None
+    vol_nr = COVERAGE_VOL_NR.get(coverage_km)
+    if vol_nr is None:
+        print(f"[warn] coverage_km={coverage_km} no reconocido; opciones validas: "
+              f"{', '.join(str(k) for k in COVERAGE_VOL_NR)}. Se ignora.")
+        return None
+    return vol_nr
+
+
+def resolve_frame_id(cfg, product_key, vol_nr=None):
     """Resuelve el frame_id a usar:
     - Si cfg['frame_id'] ya tiene un valor, se respeta tal cual (pero ver
       la salvaguarda en resolve_frame() para el caso en que apunte a una
       variante filtrada).
     - Si es None, se busca automaticamente el ULTIMO frame disponible para
-      cfg['radar_code'] + product_key, consultando
-      /api/v1/cogs?radar_code=...&product_key=...&limit=1."""
+      cfg['radar_code'] + product_key (+ vol_nr si se especifica, para
+      elegir entre la cobertura de 240 km o 450 km; ver
+      COVERAGE_VOL_NR/cfg['coverage_km']), consultando
+      /api/v1/cogs?radar_code=...&product_key=...&limit=1[&vol_nr=...]."""
     if cfg.get("frame_id"):
         return cfg["frame_id"]
 
@@ -550,18 +625,24 @@ def resolve_frame_id(cfg, product_key):
 
     url = (f"{cfg['base_url']}/cogs?radar_code={radar_code}"
            f"&product_key={product_key}&limit=1")
+    if vol_nr:
+        url += f"&vol_nr={vol_nr}"
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         cogs = resp.json().get("cogs", [])
         if not cogs:
+            extra = f" con vol_nr='{vol_nr}' (cobertura {cfg.get('coverage_km')} km)" if vol_nr else ""
             sys.exit(
                 f"[error] No se encontro ningun frame reciente para "
-                f"radar_code='{radar_code}' product_key='{product_key}' en {url}. "
-                "Verifica que el radar este activo y que la variable tenga datos."
+                f"radar_code='{radar_code}' product_key='{product_key}'{extra} en {url}. "
+                "Verifica que el radar este activo, que la variable tenga datos, y que "
+                "ese radar realmente tenga una estrategia de cobertura extendida (450 km) "
+                "si se pidio 'coverage_km=450'."
             )
         frame_id = cogs[0]["id"]
-        print(f"[info] Ultimo frame de '{radar_code}'/'{product_key}': "
+        print(f"[info] Ultimo frame de '{radar_code}'/'{product_key}'"
+              f"{f' (vol_nr={vol_nr})' if vol_nr else ''}: "
               f"id={frame_id} ({cogs[0].get('observation_time')})")
         return frame_id
     except SystemExit:
@@ -584,9 +665,13 @@ def resolve_frame(cfg):
        --frame-id manual que en realidad corresponde a 'DBZH' en vez de
        'DBZHo'), se avisa y se reintenta automaticamente buscando el
        frame sin filtrar equivalente (mismo radar, misma variable) en vez
-       de graficar la version filtrada."""
+       de graficar la version filtrada. Tambien resuelve 'vol_nr' a partir
+       de cfg['coverage_km'] (240 o 450), para elegir la cobertura de
+       240 km o 450 km cuando la resolucion es automatica (ver
+       COVERAGE_VOL_NR)."""
     product_key = resolve_product_key(cfg)
-    frame_id = resolve_frame_id(cfg, product_key)
+    vol_nr = resolve_vol_nr(cfg)
+    frame_id = resolve_frame_id(cfg, product_key, vol_nr=vol_nr)
     cfg["frame_id"] = frame_id
 
     frame_meta = fetch_frame_metadata(cfg)
@@ -602,7 +687,7 @@ def resolve_frame(cfg):
               "equivalente en su lugar.")
         cfg["frame_id"] = None  # forzar re-resolucion automatica
         unfiltered_key = FILTERED_PRODUCT_KEYS.get(real_key, product_key)
-        frame_id = resolve_frame_id(cfg, unfiltered_key)
+        frame_id = resolve_frame_id(cfg, unfiltered_key, vol_nr=vol_nr)
         cfg["frame_id"] = frame_id
         frame_meta = fetch_frame_metadata(cfg)
 
@@ -632,27 +717,64 @@ def fetch_frame_metadata(cfg):
         return {}
 
 
-def fetch_product_info(cfg, product_key):
-    """Consulta /api/v1/products y devuelve el diccionario del producto
-    indicado (product_title, product_description, min_value, max_value,
-    unit, references [lista de {value, color, title}]). Devuelve {} si
-    no se encuentra o falla la consulta."""
-    if not product_key:
-        return {}
+def fetch_all_products(cfg):
+    """Consulta /api/v1/products una sola vez y devuelve la lista completa
+    de productos. Devuelve [] si falla la consulta."""
     url = f"{cfg['base_url']}/products"
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        for product in data.get("products", []):
-            if product.get("product_key") == product_key:
-                print(f"[info] Info de producto '{product_key}' obtenida desde {url}")
-                return product
-        print(f"[warn] product_key '{product_key}' no encontrado en {url}; "
-              "se omite la colorbar y se usa un nombre de producto generico.")
+        return resp.json().get("products", [])
     except Exception as exc:
         print(f"[warn] No se pudo consultar {url} ({exc}).")
-    return {}
+        return []
+
+
+def fetch_product_info(cfg, product_key):
+    """Devuelve el diccionario de producto (product_title,
+    product_description, min_value, max_value, unit, references [lista de
+    {value, color, title}]) correspondiente a 'product_key', consultando
+    /api/v1/products. Devuelve {} si no se encuentra o falla la consulta.
+
+    Si el producto encontrado tiene 'references' VACIO (esto ocurre con
+    las variantes SIN FILTRAR de OHMC, ej. 'COLMAXo'/'DBZHo', que este
+    script usa siempre por la salvaguarda anti-filtrado, ver
+    resolve_product_key()), se completan las 'references' "prestandolas"
+    de la variante FILTRADA equivalente (ej. 'COLMAX'/'DBZH'), que si las
+    trae. Esto es seguro porque ambas variantes comparten la misma escala
+    de color (mismo cog_cmap, mismo min_value/max_value en OHMC); lo unico
+    que falta en la variante sin filtrar es la lista de colores/valores
+    de referencia para dibujar la leyenda, no un rango distinto. Sin este
+    fallback, la colorbar queda vacia con el aviso:
+        [info] No hay suficientes referencias de color para dibujar la
+        colorbar; se omite."""
+    if not product_key:
+        return {}
+    products = fetch_all_products(cfg)
+    if not products:
+        return {}
+
+    by_key = {p.get("product_key"): p for p in products}
+    product = by_key.get(product_key)
+    if product is None:
+        print(f"[warn] product_key '{product_key}' no encontrado en /api/v1/products; "
+              "se omite la colorbar y se usa un nombre de producto generico.")
+        return {}
+
+    print(f"[info] Info de producto '{product_key}' obtenida desde /api/v1/products")
+
+    if not product.get("references"):
+        filtered_key = UNFILTERED_TO_FILTERED_KEYS.get(product_key)
+        filtered_product = by_key.get(filtered_key) if filtered_key else None
+        if filtered_product and filtered_product.get("references"):
+            print(f"[info] '{product_key}' no trae 'references' propias; se usan "
+                  f"las de su variante filtrada '{filtered_key}' solo para la "
+                  "colorbar (misma escala de color; la imagen del radar sigue "
+                  f"siendo la de '{product_key}', sin filtrar).")
+            product = dict(product)  # no mutar el dict cacheado
+            product["references"] = filtered_product["references"]
+
+    return product
 
 
 def build_title(cfg, frame_meta, product_info):
@@ -861,14 +983,32 @@ def load_boundary_layer(path, layer_name="capa"):
 
 
 def compute_map_extent(cfg, bbox):
+    """Calcula el extent visible del mapa a partir del bbox del frame.
+    Prioridad del margen:
+    1) cfg['map_extent'] fijo, si esta configurado.
+    2) cfg['extent_margin_pct'] (RECOMENDADO): margen proporcional al
+       ancho/alto del bbox (ej. 0.08 = 8%). Mantiene el mismo nivel de
+       zoom relativo sin importar si el radar cubre 240 km o 450 km.
+    3) cfg['extent_margin_deg']: margen fijo en grados (comportamiento
+       anterior), usado solo si 'extent_margin_pct' es None/0.
+    """
     if cfg.get("map_extent"):
         return cfg["map_extent"]
-    m = cfg.get("extent_margin_deg", 1.5)
+
+    lon_span = bbox["max_lon"] - bbox["min_lon"]
+    lat_span = bbox["max_lat"] - bbox["min_lat"]
+    pct = cfg.get("extent_margin_pct")
+    if pct:
+        m_lon = lon_span * pct
+        m_lat = lat_span * pct
+    else:
+        m_lon = m_lat = cfg.get("extent_margin_deg", 1.5)
+
     return [
-        bbox["min_lon"] - m,
-        bbox["max_lon"] + m,
-        bbox["min_lat"] - m,
-        bbox["max_lat"] + m,
+        bbox["min_lon"] - m_lon,
+        bbox["max_lon"] + m_lon,
+        bbox["min_lat"] - m_lat,
+        bbox["max_lat"] + m_lat,
     ]
 
 
@@ -953,6 +1093,11 @@ def parse_args(cfg):
     parser.add_argument("--radar-code", type=str, default=cfg["radar_code"],
                          help="Codigo de radar (ej. RMA2, RMA14) para resolver el bbox "
                               "automaticamente desde /api/v1/radars?active_only=true.")
+    parser.add_argument("--coverage-km", type=int, default=cfg["coverage_km"],
+                         choices=list(COVERAGE_VOL_NR),
+                         help="Radio de cobertura a usar cuando la resolucion del frame "
+                              "es automatica (sin --frame-id): 240 o 450 km. Si se omite, "
+                              "se usa el comportamiento por defecto de OHMC.")
     parser.add_argument("--output", type=str, default=cfg["output_path"])
     parser.add_argument("--provinces", type=str, default=cfg["provinces_path"],
                          help="Path a un GeoJSON/Shapefile de limites provinciales.")
@@ -976,6 +1121,7 @@ def parse_args(cfg):
     cfg["frame_id"] = args.frame_id
     cfg["colormap"] = args.colormap
     cfg["radar_code"] = args.radar_code
+    cfg["coverage_km"] = args.coverage_km
     cfg["output_path"] = args.output
     cfg["provinces_path"] = args.provinces
     cfg["departments_path"] = args.departments
