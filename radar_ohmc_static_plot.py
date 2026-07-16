@@ -222,6 +222,24 @@ COVERAGE_VOL_NR = {
 }
 
 # =============================================================================
+# Range rings (anillos de rango del radar, CONFIG["range_rings_km"])
+# =============================================================================
+# Dibuja circulos geodesicos (geograficamente precisos, calculados con
+# cartopy.geodesic.Geodesic) centrados en la ubicacion real de la antena
+# del radar (ver resolve_radar_center()), a las distancias indicadas en
+# CONFIG["range_rings_km"]. Sirven de referencia visual rapida para saber
+# hasta donde llega la cobertura del radar sin tener que estimarlo a ojo.
+#
+# Por defecto se dibujan 2 anillos: uno fijo de 120 km (radio tipico de
+# "buena calidad" de deteccion de muchos productos de radar), y otro que
+# coincide con la cobertura elegida en CONFIG["coverage_km"] (240 o
+# 450 km) - si "coverage_km" no esta configurado, se usa 240 km como
+# default razonable para el segundo anillo. Se puede pasar una lista
+# propia de distancias (en km) para dibujar cualquier otro conjunto de
+# anillos, o None/[] para no dibujar ninguno.
+DEFAULT_RANGE_RING_KM = 120
+
+# =============================================================================
 # Tema del mapa: claro ("light") vs oscuro ("dark")
 # =============================================================================
 # Cada tema es un conjunto de colores coordinado para tierra, oceano, y
@@ -362,6 +380,66 @@ def add_locality_labels(ax, extent, cfg):
                 transform=ccrs.PlateCarree(), zorder=20)
         ax.text(lon, lat, f"  {name}", color="white", fontsize=7,
                 ha="left", va="center", transform=ccrs.PlateCarree(), zorder=20)
+
+
+def resolve_range_rings_km(cfg):
+    """Resuelve la lista de distancias (en km) a las que dibujar range
+    rings, a partir de cfg['range_rings_km']:
+    - None (default): se resuelve automaticamente a [120, coverage_km],
+      usando cfg['coverage_km'] si esta configurado (240 o 450), o 240
+      como default razonable si no lo esta. DEFAULT_RANGE_RING_KM (120)
+      siempre se incluye como referencia de "buena cobertura".
+    - Lista/tupla de numeros: se usa tal cual (permite personalizar
+      completamente los anillos, ej. [100, 200, 300]).
+    - Lista vacia o cualquier valor "falsy": no se dibuja ningun anillo.
+    Devuelve una lista de floats (sin duplicados, ordenada)."""
+    rings = cfg.get("range_rings_km")
+    if rings is None:
+        coverage_km = cfg.get("coverage_km") or 240
+        rings = [DEFAULT_RANGE_RING_KM, coverage_km]
+    if not rings:
+        return []
+    return sorted({float(r) for r in rings if r})
+
+
+def add_range_rings(ax, cfg, frame_meta=None, bbox=None):
+    """Dibuja circulos geodesicos (calculados con cartopy.geodesic, para
+    que sean geograficamente precisos y no se vean "achatados" lejos del
+    ecuador) centrados en la ubicacion real de la antena del radar (ver
+    resolve_radar_center()), a las distancias resueltas por
+    resolve_range_rings_km(). Cada anillo se etiqueta con su distancia
+    (ej. "120 km") junto al borde. No dibuja nada si no se pudo resolver
+    el centro del radar, o si la lista de distancias esta vacia."""
+    ring_km_list = resolve_range_rings_km(cfg)
+    if not ring_km_list:
+        return
+
+    center = resolve_radar_center(cfg, frame_meta=frame_meta, bbox=bbox)
+    if center is None:
+        print("[warn] No se pudo resolver el centro del radar; se omiten los range rings.")
+        return
+    center_lat, center_lon = center
+
+    from cartopy.geodesic import Geodesic
+    geod = Geodesic()
+    ring_color = cfg.get("range_rings_color") or (
+        "#FFFFFF" if cfg.get("theme") == "dark" else "#444444"
+    )
+
+    for ring_km in ring_km_list:
+        circle_pts = geod.circle(lon=center_lon, lat=center_lat,
+                                  radius=ring_km * 1000.0, n_samples=180)
+        ax.plot(circle_pts[:, 0], circle_pts[:, 1], color=ring_color,
+                linewidth=0.7, linestyle="--", alpha=0.8,
+                transform=ccrs.PlateCarree(), zorder=15)
+        # Etiqueta de distancia, ubicada en el punto mas al este del anillo
+        # (angulo 90=Este en la convencion de Geodesic.circle) para que no
+        # se solapen entre si los distintos anillos.
+        label_pt = geod.direct(points=[[center_lon, center_lat]],
+                                azimuths=[90], distances=[ring_km * 1000.0])[0]
+        ax.text(label_pt[0], label_pt[1], f" {ring_km:g} km", color=ring_color,
+                fontsize=6, ha="left", va="center",
+                transform=ccrs.PlateCarree(), zorder=15)
 
 # =============================================================================
 # Busqueda historica por fecha/hora (CONFIG["target_datetime"] / --datetime)
@@ -648,6 +726,20 @@ CONFIG = {
     # apply_font().
     "font_path": None,
 
+    # --- Range rings: anillos de rango del radar (opcional) ---
+    # Dibuja circulos geodesicos de referencia centrados en la antena
+    # real del radar, para ver rapido hasta donde llega la cobertura.
+    # Si "range_rings_km" es None (default), se dibujan automaticamente
+    # 2 anillos: uno fijo de 120 km (ver DEFAULT_RANGE_RING_KM) y otro
+    # que coincide con "coverage_km" (240 o 450; si "coverage_km" no
+    # esta configurado, se usa 240 km). Poné una lista propia (ej.
+    # [100, 200, 300]) para elegir tus propias distancias, o [] para no
+    # dibujar ningun anillo. "range_rings_color" es None por defecto:
+    # se usa blanco en tema "dark" y gris oscuro en tema "light"/otros
+    # (ver add_range_rings()); poné un color fijo para forzarlo.
+    "range_rings_km": None,
+    "range_rings_color": None,
+
     # --- Colores del mapa base ---
     # NOTA: si "theme" arriba coincide con un preset ("light"/"dark"),
     # estos valores se SOBREESCRIBEN automaticamente por los del preset
@@ -727,35 +819,75 @@ def download_radar_image(cfg):
     return arr
 
 
-def fetch_radar_extent(cfg):
-    """Consulta /api/v1/radars?active_only=true y devuelve el bbox
-    (convertido desde 'extent') del radar indicado en cfg['radar_code'].
-    Devuelve None si no hay radar_code configurado, o si no se lo
-    encuentra / falla la consulta."""
+def fetch_radar_info(cfg):
+    """Consulta /api/v1/radars?active_only=true y devuelve el diccionario
+    COMPLETO del radar indicado en cfg['radar_code'] (incluye 'extent',
+    'center_lat', 'center_long', 'title', etc.). Devuelve None si no hay
+    radar_code configurado, o si no se lo encuentra / falla la consulta.
+    Se cachea en cfg['_radar_info_cache'] para no repetir la consulta si
+    se llama mas de una vez con el mismo radar_code (ver
+    fetch_radar_extent() y resolve_radar_center())."""
     radar_code = cfg.get("radar_code")
     if not radar_code:
         return None
+    cache = cfg.setdefault("_radar_info_cache", {})
+    if radar_code in cache:
+        return cache[radar_code]
     url = f"{cfg['base_url']}/radars?active_only=true"
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         for radar in data.get("radars", []):
-            if radar.get("code") == radar_code:
-                ext = radar["extent"]
-                print(f"[info] bbox de '{radar_code}' ({radar.get('title', '')}) "
-                      f"obtenido automaticamente desde {url}")
-                return {
-                    "min_lon": ext["lon_min"],
-                    "min_lat": ext["lat_min"],
-                    "max_lon": ext["lon_max"],
-                    "max_lat": ext["lat_max"],
-                }
-        print(f"[warn] radar_code '{radar_code}' no encontrado en {url}; "
-              "se usa 'radar_bbox' del CONFIG.")
+            cache[radar.get("code")] = radar
+        if radar_code in cache:
+            return cache[radar_code]
+        print(f"[warn] radar_code '{radar_code}' no encontrado en {url}.")
     except Exception as exc:
-        print(f"[warn] No se pudo consultar {url} ({exc}); "
-              "se usa 'radar_bbox' del CONFIG.")
+        print(f"[warn] No se pudo consultar {url} ({exc}).")
+    cache[radar_code] = None
+    return None
+
+
+def fetch_radar_extent(cfg):
+    """Devuelve el bbox (convertido desde 'extent') del radar indicado en
+    cfg['radar_code'], usando fetch_radar_info(). Devuelve None si no se
+    encuentra el radar o falla la consulta (en cuyo caso se usa
+    'radar_bbox' del CONFIG como fallback, ver resolve_bbox())."""
+    radar = fetch_radar_info(cfg)
+    if radar is None:
+        return None
+    ext = radar["extent"]
+    print(f"[info] bbox de '{cfg.get('radar_code')}' ({radar.get('title', '')}) "
+          f"obtenido automaticamente desde /api/v1/radars.")
+    return {
+        "min_lon": ext["lon_min"],
+        "min_lat": ext["lat_min"],
+        "max_lon": ext["lon_max"],
+        "max_lat": ext["lat_max"],
+    }
+
+
+def resolve_radar_center(cfg, frame_meta=None, bbox=None):
+    """Resuelve las coordenadas (lat, lon) del CENTRO del radar (donde
+    esta ubicada la antena), usadas como centro de los range rings (ver
+    add_range_rings()). Prioridad:
+    1) 'center_lat'/'center_long' reales del radar, desde
+       /api/v1/radars?active_only=true (RECOMENDADO: es la ubicacion
+       exacta de la antena, no un punto aproximado).
+    2) Si no se pudo obtener (radar_code no configurado/no encontrado),
+       se usa el centro geometrico del bbox como aproximacion.
+    Devuelve (lat, lon), o None si no hay ninguna fuente disponible."""
+    radar = fetch_radar_info(cfg)
+    if radar and radar.get("center_lat") is not None and radar.get("center_long") is not None:
+        return radar["center_lat"], radar["center_long"]
+    if bbox:
+        print("[warn] No se pudo obtener el centro real del radar; se usa el "
+              "centro geometrico del bbox como aproximacion para los range rings.")
+        return (
+            (bbox["min_lat"] + bbox["max_lat"]) / 2,
+            (bbox["min_lon"] + bbox["max_lon"]) / 2,
+        )
     return None
 
 
@@ -1415,6 +1547,9 @@ def build_plot(radar_rgba, bbox, cfg, frame_meta=None, product_info=None):
     # la localidad se siga viendo bien aunque quede "debajo" del eco.
     add_locality_labels(ax, extent, cfg)
 
+    # --- Range rings (anillos de rango del radar, opcional) ---
+    add_range_rings(ax, cfg, frame_meta=frame_meta, bbox=bbox)
+
     # --- Colorbar del producto al costado (opcional) ---
     if cfg.get("show_colorbar", True):
         build_colorbar(fig, ax, cfg, product_info, frame_meta=frame_meta)
@@ -1488,6 +1623,15 @@ def parse_args(cfg):
                               "del plot (titulo, colorbar, etiquetas de localidades). Si "
                               f"se omite, se usa '{DEFAULT_FONT_FILENAME}' (incluida junto "
                               "al script).")
+    parser.add_argument("--range-rings", type=str, default=None,
+                         help="Distancias (km) para los range rings, separadas por coma "
+                              "(ej. '120,240' o '100,200,300'). Si se omite, se dibujan "
+                              f"automaticamente {DEFAULT_RANGE_RING_KM} km + el valor de "
+                              "--coverage-km (240 por defecto). Pasa '' (vacio) para no "
+                              "dibujar ningun anillo.")
+    parser.add_argument("--range-rings-color", type=str, default=cfg["range_rings_color"],
+                         help="Color de los range rings. Si se omite, se usa blanco con "
+                              "--theme dark, o gris oscuro en caso contrario.")
     parser.add_argument("--no-show", action="store_true",
                          help="No abrir ventana de matplotlib; solo guardar el archivo.")
     args = parser.parse_args()
@@ -1506,6 +1650,12 @@ def parse_args(cfg):
     cfg["palette"] = args.palette
     cfg["theme"] = args.theme
     cfg["font_path"] = args.font
+    if args.range_rings is not None:
+        text = args.range_rings.strip()
+        cfg["range_rings_km"] = (
+            [float(v) for v in text.split(",") if v.strip()] if text else []
+        )
+    cfg["range_rings_color"] = args.range_rings_color
     if args.no_colorbar:
         cfg["show_colorbar"] = False
     if args.no_show:
