@@ -217,6 +217,58 @@ COVERAGE_VOL_NR = {
 }
 
 # =============================================================================
+# Tema del mapa: claro ("light") vs oscuro ("dark")
+# =============================================================================
+# Cada tema es un conjunto de colores coordinado para tierra, oceano, y
+# TODOS los limites (nacional/pais, provincial, departamental), aplicado
+# de una sola vez con CONFIG["theme"] / --theme, en vez de tener que
+# tocar cada color por separado.
+#
+#   "light" (default, look actual del script): tierra blanca, oceano
+#   celeste marino clarito, limites en tonos de gris oscuro/medio.
+#
+#   "dark": tierra y oceano NEGROS, con limites nacionales, provinciales
+#   y departamentales en GRIS CLARO (para que se distingan sobre el
+#   fondo negro). Pensado para resaltar el overlay de color del radar.
+#
+# "custom" (o cualquier valor no listado en THEME_PRESETS, ej. None) NO
+# aplica ningun preset: se respetan los colores que ya esten seteados a
+# mano en CONFIG (land_color, ocean_color, coastline_color, etc.), por
+# si se quiere una combinacion propia distinta a "light"/"dark".
+THEME_PRESETS = {
+    "light": {
+        "land_color": "#FFFFFF",
+        "ocean_color": "#CFEAF5",
+        "coastline_color": "#666666",
+        "border_color": "#999999",
+        "provinces_color": "#555555",
+        "departments_color": "#808080",
+    },
+    "dark": {
+        "land_color": "#000000",
+        "ocean_color": "#000000",
+        "coastline_color": "#D3D3D3",
+        "border_color": "#D3D3D3",
+        "provinces_color": "#D3D3D3",
+        "departments_color": "#D3D3D3",
+    },
+}
+
+
+def apply_theme(cfg):
+    """Si cfg['theme'] coincide con una clave de THEME_PRESETS ("light" o
+    "dark"), sobreescribe en 'cfg' los colores de tierra/oceano/limites
+    con los del preset elegido. Si cfg['theme'] es None o no coincide con
+    ningun preset (ej. "custom"), no hace nada: se respetan los colores
+    que ya esten definidos en CONFIG/'cfg' tal cual."""
+    theme = cfg.get("theme")
+    preset = THEME_PRESETS.get(theme)
+    if preset is None:
+        return
+    cfg.update(preset)
+    print(f"[info] Tema '{theme}' aplicado (tierra/oceano/limites).")
+
+# =============================================================================
 # Busqueda historica por fecha/hora (CONFIG["target_datetime"] / --datetime)
 # =============================================================================
 # OHMC permite consultar /api/v1/cogs con un rango de tiempo (start_time/
@@ -481,7 +533,22 @@ CONFIG = {
     "extent_margin_pct": 0.08,
     "extent_margin_deg": 1.5,
 
+    # --- Tema del mapa: "light" o "dark" (ver THEME_PRESETS) ---
+    # Aplica de una sola vez un conjunto coordinado de colores para
+    # tierra, oceano y TODOS los limites (nacional/provincial/
+    # departamental). "light" = tierra blanca / oceano celeste (look
+    # anterior del script). "dark" = tierra y oceano negros, limites en
+    # gris claro. Poné None (o cualquier valor no listado en
+    # THEME_PRESETS, ej. "custom") para NO aplicar ningun preset y usar
+    # los colores individuales de mas abajo (land_color, ocean_color,
+    # etc.) tal cual esten configurados. Ver apply_theme().
+    "theme": "light",
+
     # --- Colores del mapa base ---
+    # NOTA: si "theme" arriba coincide con un preset ("light"/"dark"),
+    # estos valores se SOBREESCRIBEN automaticamente por los del preset
+    # (ver apply_theme()); solo tienen efecto real si "theme" es None o
+    # un valor no reconocido (ej. "custom").
     "land_color": "#FFFFFF",       # tierra: blanco
     "ocean_color": "#CFEAF5",      # oceano: celeste marino clarito
     "coastline_color": "#666666",
@@ -492,7 +559,8 @@ CONFIG = {
     # (ej. descargado de datos IGN/INDEC). Si es None, no se dibuja
     # esta capa. Se dibuja ANTES de los limites departamentales, con
     # una linea mas gruesa, para que ambas capas se distingan si se
-    # usan juntas.
+    # usan juntas. El color (provinces_color) tambien se sobreescribe
+    # por "theme" si corresponde, igual que los colores de arriba.
     "provinces_path": None,
     "provinces_color": "#555555",
     "provinces_linewidth": 1.0,
@@ -500,7 +568,8 @@ CONFIG = {
     # --- Limites departamentales (opcional) ---
     # Path a un archivo .geojson o .shp con límites departamentales
     # (ej. descargado de datos IGN/INDEC). Si es None, no se dibuja
-    # esta capa.
+    # esta capa. El color (departments_color) tambien se sobreescribe
+    # por "theme" si corresponde, igual que los colores de arriba.
     "departments_path": None,
     "departments_color": "#808080",
     "departments_linewidth": 0.5,
@@ -1298,6 +1367,13 @@ def parse_args(cfg):
     parser.add_argument("--title", type=str, default=cfg["title"],
                          help="Titulo fijo del mapa. Si se omite, se genera "
                               "automaticamente a partir de la metadata del frame.")
+    parser.add_argument("--theme", type=str, default=cfg["theme"],
+                         choices=list(THEME_PRESETS),
+                         help="Tema de color del mapa base: 'light' (tierra blanca/oceano "
+                              "celeste, limites en gris oscuro) o 'dark' (tierra y oceano "
+                              "negros, limites en gris claro). Aplica de una sola vez a "
+                              "tierra, oceano, y limites nacionales/provinciales/"
+                              "departamentales.")
     parser.add_argument("--no-show", action="store_true",
                          help="No abrir ventana de matplotlib; solo guardar el archivo.")
     args = parser.parse_args()
@@ -1314,6 +1390,7 @@ def parse_args(cfg):
     cfg["departments_path"] = args.departments
     cfg["title"] = args.title
     cfg["palette"] = args.palette
+    cfg["theme"] = args.theme
     if args.no_colorbar:
         cfg["show_colorbar"] = False
     if args.no_show:
@@ -1343,6 +1420,7 @@ def save_figure(fig, cfg):
 
 def main():
     cfg = parse_args(CONFIG)
+    apply_theme(cfg)
 
     # Resuelve frame_id/colormap (automatico por variable + radar_code, o
     # manual si se especifico --frame-id), aplicando la salvaguarda que
