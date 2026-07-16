@@ -134,12 +134,17 @@ from PIL import Image
 
 try:
     import matplotlib.colors as mcolors
+    import matplotlib.font_manager as fm
     import matplotlib.pyplot as plt
 except ImportError:
     sys.exit(
         "Falta matplotlib. Instalá con:\n"
         "  conda install -c conda-forge matplotlib"
     )
+
+# Directorio donde vive este script (para resolver "fuenteSMN.ttf" y otros
+# archivos relativos sin depender del directorio de trabajo actual).
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 
 # Zona horaria de Argentina (fija, sin horario de verano desde 2009).
 ART_TZ = timezone(timedelta(hours=-3))
@@ -267,6 +272,96 @@ def apply_theme(cfg):
         return
     cfg.update(preset)
     print(f"[info] Tema '{theme}' aplicado (tierra/oceano/limites).")
+
+
+# =============================================================================
+# Fuente de texto principal del plot (CONFIG["font_path"] / --font)
+# =============================================================================
+# Todo el texto que dibuja este script (titulo, colorbar, y las etiquetas
+# de localidades del tema "dark", ver LOCALITIES) usa una sola fuente
+# configurable, en vez de la fuente default de matplotlib (DejaVu Sans).
+#
+# Por defecto apunta a "fuenteSMN.ttf", incluida en este mismo repositorio
+# junto al script. Esa fuente es en realidad una copia renombrada de
+# "DejaVu Sans Mono" (variante monoespaciada de la tipografia default de
+# matplotlib, de uso libre/redistribuible), pedida asi por el usuario;
+# se puede reemplazar por cualquier otro archivo .ttf/.otf propio sin
+# cambiar el codigo, solo actualizando CONFIG["font_path"] / --font.
+DEFAULT_FONT_FILENAME = "fuenteSMN.ttf"
+
+
+def resolve_font_path(cfg):
+    """Resuelve el path al archivo de fuente a usar, a partir de
+    cfg['font_path']:
+    - None (default) -> busca DEFAULT_FONT_FILENAME ("fuenteSMN.ttf") en
+      el mismo directorio que este script (SCRIPT_DIR).
+    - Un path (str) -> se usa tal cual, si el archivo existe.
+    Devuelve un Path si el archivo existe, o None si no se encontro
+    (en cuyo caso se usa la fuente default de matplotlib, sin fallar)."""
+    font_path = cfg.get("font_path")
+    candidate = Path(font_path) if font_path else (SCRIPT_DIR / DEFAULT_FONT_FILENAME)
+    if candidate.is_file():
+        return candidate
+    if font_path:
+        print(f"[warn] No se encontro el archivo de fuente '{candidate}'; "
+              "se usa la fuente default de matplotlib.")
+    return None
+
+
+def apply_font(cfg):
+    """Registra el archivo de fuente resuelto (ver resolve_font_path) en
+    matplotlib.font_manager, y lo fija como fuente ('font.family') para
+    TODO el texto dibujado por el script (titulo, colorbar, etiquetas de
+    localidades). Si no se encuentra ningun archivo de fuente valido, no
+    hace nada y se sigue usando la fuente default de matplotlib."""
+    font_file = resolve_font_path(cfg)
+    if font_file is None:
+        return
+    try:
+        fm.fontManager.addfont(str(font_file))
+        font_name = fm.FontProperties(fname=str(font_file)).get_name()
+        plt.rcParams["font.family"] = font_name
+        print(f"[info] Fuente '{font_file.name}' aplicada como fuente principal del plot "
+              f"(font.family='{font_name}').")
+    except Exception as exc:
+        print(f"[warn] No se pudo cargar la fuente '{font_file}' ({exc}); "
+              "se usa la fuente default de matplotlib.")
+
+
+# =============================================================================
+# Etiquetas de localidades principales (solo tema "dark")
+# =============================================================================
+# A pedido del usuario, en el tema "dark" (fondo negro) se agregan
+# etiquetas de texto BLANCO con el nombre de algunas localidades
+# principales, para dar referencia geografica sin necesitar limites
+# provinciales/departamentales cargados. Coordenadas aproximadas del
+# centro de cada localidad (WGS84, grados decimales).
+LOCALITIES = {
+    "Buenos Aires": (-34.6037, -58.3816),
+    "Pergamino": (-33.8961, -60.5764),
+    "Parana": (-31.7333, -60.5167),
+    "Bahia Blanca": (-38.7196, -62.2724),
+    "Olavarria": (-36.8927, -60.3225),
+    "San Francisco (Cordoba)": (-31.4241, -62.0836),
+}
+
+
+def add_locality_labels(ax, extent, cfg):
+    """Dibuja, solo si cfg['theme'] es 'dark', un punto + etiqueta de
+    texto en color BLANCO para cada localidad de LOCALITIES cuya
+    coordenada caiga dentro del 'extent' visible del mapa (las que
+    quedan fuera del area graficada se omiten, para no ensuciar el plot
+    con etiquetas invisibles/cortadas en el borde)."""
+    if cfg.get("theme") != "dark":
+        return
+    lon_min, lon_max, lat_min, lat_max = extent
+    for name, (lat, lon) in LOCALITIES.items():
+        if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
+            continue
+        ax.plot(lon, lat, marker="o", markersize=3, color="white",
+                transform=ccrs.PlateCarree(), zorder=20)
+        ax.text(lon, lat, f"  {name}", color="white", fontsize=7,
+                ha="left", va="center", transform=ccrs.PlateCarree(), zorder=20)
 
 # =============================================================================
 # Busqueda historica por fecha/hora (CONFIG["target_datetime"] / --datetime)
@@ -543,6 +638,15 @@ CONFIG = {
     # los colores individuales de mas abajo (land_color, ocean_color,
     # etc.) tal cual esten configurados. Ver apply_theme().
     "theme": "light",
+
+    # --- Fuente de texto principal del plot (opcional) ---
+    # Si "font_path" es None (default), se usa "fuenteSMN.ttf" (incluida
+    # junto a este script; es una copia de DejaVu Sans Mono renombrada a
+    # pedido del usuario). Poné un path a tu propio archivo .ttf/.otf
+    # para usar otra fuente. Si el archivo no se encuentra, se cae de
+    # vuelta a la fuente default de matplotlib sin fallar. Ver
+    # apply_font().
+    "font_path": None,
 
     # --- Colores del mapa base ---
     # NOTA: si "theme" arriba coincide con un preset ("light"/"dark"),
@@ -1306,6 +1410,11 @@ def build_plot(radar_rgba, bbox, cfg, frame_meta=None, product_info=None):
         zorder=10,
     )
 
+    # --- Etiquetas de localidades principales (solo tema "dark") ---
+    # zorder mayor al del overlay del radar (10), para que el nombre de
+    # la localidad se siga viendo bien aunque quede "debajo" del eco.
+    add_locality_labels(ax, extent, cfg)
+
     # --- Colorbar del producto al costado (opcional) ---
     if cfg.get("show_colorbar", True):
         build_colorbar(fig, ax, cfg, product_info, frame_meta=frame_meta)
@@ -1374,6 +1483,11 @@ def parse_args(cfg):
                               "negros, limites en gris claro). Aplica de una sola vez a "
                               "tierra, oceano, y limites nacionales/provinciales/"
                               "departamentales.")
+    parser.add_argument("--font", type=str, default=cfg["font_path"],
+                         help="Path a un archivo .ttf/.otf a usar como fuente principal "
+                              "del plot (titulo, colorbar, etiquetas de localidades). Si "
+                              f"se omite, se usa '{DEFAULT_FONT_FILENAME}' (incluida junto "
+                              "al script).")
     parser.add_argument("--no-show", action="store_true",
                          help="No abrir ventana de matplotlib; solo guardar el archivo.")
     args = parser.parse_args()
@@ -1391,6 +1505,7 @@ def parse_args(cfg):
     cfg["title"] = args.title
     cfg["palette"] = args.palette
     cfg["theme"] = args.theme
+    cfg["font_path"] = args.font
     if args.no_colorbar:
         cfg["show_colorbar"] = False
     if args.no_show:
@@ -1421,6 +1536,7 @@ def save_figure(fig, cfg):
 def main():
     cfg = parse_args(CONFIG)
     apply_theme(cfg)
+    apply_font(cfg)
 
     # Resuelve frame_id/colormap (automatico por variable + radar_code, o
     # manual si se especifico --frame-id), aplicando la salvaguarda que
