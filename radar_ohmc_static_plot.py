@@ -771,7 +771,14 @@ CONFIG = {
     "departments_linewidth": 0.5,
 
     # --- Overlay del radar ---
-    "radar_opacity": 0.85,  # multiplicador extra sobre la transparencia ya presente en el PNG
+    # NOTA: se confirmo descargando y analizando el PNG real de OHMC que
+    # el archivo en si NO trae opacidad reducida "horneada": el canal
+    # alpha de los pixeles con eco es 255 (100%) siempre. El "70% por
+    # defecto" que se ve en el visor web de OHMC es un slider de la
+    # interfaz (field-opacity-slider, value="0.7"), no una propiedad del
+    # archivo. Por eso "radar_opacity" (el multiplicador que aplica este
+    # script) se deja en 1.0, para mostrar el eco a opacidad completa.
+    "radar_opacity": 1.0,  # multiplicador extra sobre la transparencia ya presente en el PNG
 
     # --- Colorbar del producto (opcional, activada por defecto) ---
     # Dibuja al costado de la imagen la leyenda/escala de color oficial
